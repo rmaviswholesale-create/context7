@@ -1,0 +1,53 @@
+# agy-proxy agent presets -- your "personal preference of agents".
+#
+# Clients select a preset by putting its name in the request's `model` field
+# (OpenAI: `model`, Anthropic: `model`). Unknown names fall back to `default`.
+#
+# Fields per preset:
+#   description         human note
+#   system_instructions extra system prompt prepended to any client system message
+#   model               underlying Gemini model (default: AGY_DEFAULT_MODEL)
+#   policy              allow_all | safe_defaults | workspace_only | deny_all | confirm_run_command
+#   behavior            autonomous | interactive
+#   thinking_level      minimal | low | medium | high | extra_high   (optional)
+#   enabled_tools       list of BuiltinTools names (omit = all).  Names:
+#                       LIST_DIR SEARCH_DIR FIND_FILE VIEW_FILE CREATE_FILE EDIT_FILE
+#                       RUN_COMMAND ASK_QUESTION START_SUBAGENT GENERATE_IMAGE
+#                       SEARCH_WEB READ_URL_CONTENT FINISH
+#   disabled_tools      list of BuiltinTools names to strip
+#   enable_subagents    true | false
+#   workspaces          list of dirs file tools are restricted to (optional)
+
+default: agy-coder
+
+presets:
+  agy-coder:
+    description: Autonomous coding agent with full toolset and high reasoning.
+    system_instructions: >
+      You are a senior software engineer. Prefer minimal, correct changes that
+      match existing conventions. Verify before claiming done.
+    policy: allow_all
+    behavior: autonomous
+    thinking_level: high
+
+  agy-researcher:
+    description: Read/search-focused analyst; cannot edit files or run shell.
+    system_instructions: >
+      You are a careful researcher. Investigate thoroughly using read and search
+      tools, cite file paths, and summarize findings. Do not modify anything.
+    policy: safe_defaults
+    behavior: autonomous
+    thinking_level: high
+    disabled_tools:
+      - CREATE_FILE
+      - EDIT_FILE
+      - RUN_COMMAND
+
+  agy-fast:
+    description: Low-latency chat/coding helper, minimal thinking, no subagents.
+    system_instructions: >
+      You are a concise, fast assistant. Answer directly.
+    policy: safe_defaults
+    behavior: autonomous
+    thinking_level: minimal
+    enable_subagents: false
