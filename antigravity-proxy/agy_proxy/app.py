@@ -6,25 +6,37 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 
 from . import __version__, anthropic_api, openai_api
 from .config import Settings
 from .context import ProxyContext
+from .errors import ProxyError, error_response
 from .presets import PresetRegistry
 from .runner import AgentRunner
+from .security import (
+    HostOriginMiddleware,
+    TokenAuthMiddleware,
+    ensure_token,
+    scrub_process_env,
+)
 from .sessions import SessionStore
 
 logger = logging.getLogger("agy_proxy")
 
-# Public, unauthenticated paths (everything else requires the bearer if configured).
-_OPEN_PATHS = {"/healthz", "/", "/docs", "/openapi.json", "/redoc"}
-
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    settings = settings or Settings.from_env()
-    registry = PresetRegistry.load(settings.presets_path, settings.default_model)
-    runner = AgentRunner(registry, settings.api_key)
+    settings = ensure_token(settings or Settings.from_env())
+    assert settings.proxy_token  # ensure_token guarantees one
+    # Secrets now live only in Settings; keep them out of the agent's environment.
+    scrub_process_env()
+
+    registry = PresetRegistry.load(
+        settings.presets_path,
+        settings.default_model,
+        workspace=settings.workspace,
+        enable_coder=settings.enable_coder,
+    )
+    runner = AgentRunner(registry, settings.api_key, settings.workspace)
     sessions = SessionStore(runner, settings.session_ttl_seconds, settings.session_max)
 
     @asynccontextmanager
@@ -34,42 +46,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "No AGY_API_KEY/GEMINI_API_KEY set; the SDK will fall back to ADC. "
                 "Set your own key to use the free Gemini tier."
             )
+        for name, reason in registry.disabled.items():
+            logger.warning("preset %r not available: %s", name, reason)
         logger.info(
-            "agy-proxy %s ready: presets=%s default=%s",
+            "agy-proxy %s ready: presets=%s default=%s workspace=%s",
             __version__,
             registry.names(),
             registry.default_name,
+            settings.workspace,
         )
         yield
         await sessions.close_all()
 
-    app = FastAPI(title="agy-proxy", version=__version__, lifespan=lifespan)
+    # No interactive docs / schema: they are unauthenticated attack surface.
+    app = FastAPI(
+        title="agy-proxy",
+        version=__version__,
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.state.ctx = ProxyContext(
         settings=settings, registry=registry, runner=runner, sessions=sessions
     )
 
-    @app.middleware("http")
-    async def auth_guard(request: Request, call_next):
-        token = settings.proxy_token
-        if token and request.url.path not in _OPEN_PATHS:
-            provided = _bearer(request)
-            if provided != token:
-                return JSONResponse(status_code=401, content={"error": "unauthorized"})
-        return await call_next(request)
+    @app.exception_handler(ProxyError)
+    async def _proxy_error(_request: Request, exc: ProxyError):
+        return error_response(exc)
 
     app.include_router(openai_api.router)
     app.include_router(anthropic_api.router)
 
     @app.get("/healthz")
     async def healthz():
-        return {
-            "status": "ok",
-            "version": __version__,
-            "presets": registry.names(),
-            "default_preset": registry.default_name,
-            "live_sessions": sessions.size(),
-            "api_key_configured": bool(settings.api_key),
-        }
+        # Unauthenticated: liveness only. Details are logged at startup, not served.
+        return {"status": "ok"}
 
     @app.get("/")
     async def root():
@@ -79,12 +91,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "endpoints": ["/v1/chat/completions", "/v1/messages", "/v1/models", "/healthz"],
         }
 
+    # add_middleware stacks outward: Host/Origin runs first, then token auth.
+    app.add_middleware(TokenAuthMiddleware, token=settings.proxy_token)
+    app.add_middleware(HostOriginMiddleware, allowed_hosts=settings.allowed_hosts)
+
     return app
-
-
-def _bearer(request: Request) -> str | None:
-    auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    # Anthropic clients send x-api-key.
-    return request.headers.get("x-api-key")

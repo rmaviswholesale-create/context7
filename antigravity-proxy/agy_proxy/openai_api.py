@@ -206,6 +206,7 @@ def _flatten_system(messages: list[dict[str, str]]) -> tuple[str | None, str]:
 @router.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     ctx = get_ctx(request)
+    ctx.registry.resolve(req.model)  # unknown model -> 404 before any streaming starts
     model_label = req.model or ctx.registry.default_name
 
     if req.stream:

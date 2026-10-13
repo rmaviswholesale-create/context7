@@ -1,6 +1,6 @@
 # `google-antigravity` SDK — verified API notes
 
-Captured by direct introspection of the installed wheel (**v0.1.x**, `pip install google-antigravity`).
+Captured by direct introspection of the installed wheel (**v0.1.21**; pinned `>=0.1.21,<0.2`).
 These are the exact surfaces `agy-proxy` depends on. Re-verify with
 `python -m agy_proxy.doctor` (or the snippet at the bottom) if the SDK is upgraded.
 
@@ -19,10 +19,12 @@ config = LocalAgentConfig(
         disabled_tools=None,
         enable_subagents=True,
     ),
-    policies=[policy.allow_all()],            # or [policy.safe_defaults()], [policy.workspace_only()], ...
+    policies=[policy.allow_all()],            # or confirm_run_command(), deny_all() (see "Policies" below)
     model="gemini-3-pro",                     # str | ModelTarget | None
     api_key="...",                            # your own key; falls back to GEMINI_API_KEY / ADC
-    workspaces=["/path"],                     # optional; restricts file tools
+    workspaces=["/path"],                     # None becomes [os.getcwd()] -- always pass explicitly
+    save_dir="/abs", app_data_dir="/abs",     # None -> mkdtemp never removed; proxy owns them (Scratch)
+    env={"PATH": "...", "HOME": "..."},       # MERGED into os.environ, cannot remove variables
     conversation_id=None,
 )
 ```
@@ -30,8 +32,7 @@ config = LocalAgentConfig(
 - `Agent(config)` is an **async context manager**: `async with Agent(config) as agent: ...`
   (spins up the Go `localharness` binary bundled in the wheel). For long-lived stateful use,
   drive `await agent.__aenter__()` / `await agent.__aexit__(None, None, None)` manually.
-- Default policy **denies `run_command`** (confirm-required). Pass `policies=[policy.allow_all()]`
-  for fully autonomous shell access.
+- Default policy **denies `run_command`**. Pass `policies=[policy.allow_all()]` for shell access.
 
 ## Chat + streaming
 
@@ -44,13 +45,15 @@ resp = await agent.chat(prompt)   # prompt: str | Image | Document | Audio | Vid
 `ChatResponse` is a lazy async multi-cursor over a shared buffer. Cursors:
 
 - `async for delta in resp:` → text tokens (str)
-- `resp.chunks` → **ordered** stream of `Text | Thought | ToolCall | ToolResult`  ← we use this
+- `resp.chunks` → ordered stream of `Text | Thought | ToolCall`  ← we use this. **`ToolResult` is
+  declared in the type union but is never produced by `Conversation.receive_chunks`** (it only yields
+  Thought/Text/ToolCall); tool results are not available on this stream.
 - `resp.thoughts` → `Thought` cursor
 - `resp.tool_calls` → `ToolCall` cursor
 - `await resp.text()` → full text
 - `await resp.resolve()` → `list[StreamChunk | ToolCall | ToolResult]`
 - `resp.stop_reason` / `resp.usage_metadata` (available after consumption)
-- `resp.cancel()`
+- `resp.cancel()` is a coroutine; no-op when the turn is done; sends a halt request
 
 ### Chunk shapes (all pydantic models)
 
@@ -87,5 +90,34 @@ model = ModelTarget(
 
 ## Note on tools
 
-The SDK executes builtin tools **internally** (file I/O, shell, search, subagents). The proxy
-surfaces `ToolCall`/`ToolResult` as informational stream events — clients do **not** fulfil them.
+The SDK executes builtin tools **internally** (file I/O, shell, search, subagents). `ToolCall`
+chunks are informational: the proxy logs them (`AGY_LOG_TOOLS`) and never sends them to clients,
+who cannot fulfil them.
+
+## Policies and tool exposure (verified in `hooks/policy.py`, `types.py`)
+
+- `confirm_run_command()` **without a handler** = `[deny(run_command), allow("*")]`: it denies shell
+  but **allows file writes** (`create_file`, `edit_file`) and everything else. It is NOT a read-only
+  policy. For read-only presets the `enabled_tools` allowlist is the real barrier (the proxy also
+  prepends explicit `deny` rules for the write tools).
+- `workspace_only(ws)` does `del workspaces` and returns `deny` for **all** file tools. It does not
+  restrict paths to the workspace; the proxy rejects it as a preset policy.
+- `enabled_tools=None` means `BuiltinTools.default()` (everything except ASK_QUESTION and the
+  LIST_DIR/SEARCH_DIR/FIND_FILE trio), which includes RUN_COMMAND, CREATE/EDIT_FILE, START_SUBAGENT,
+  SEARCH_WEB, READ_URL_CONTENT, SCHEDULE, GENERATE_IMAGE. `enabled_tools=[]` resolves to an empty set
+  (tool-less agent). `enabled_tools` and `disabled_tools` are mutually exclusive.
+- `allow_all()` + `workspaces` is **not** proven to confine anything: nothing in the Python SDK ties
+  `run_command` or file tools to `workspaces`. Treat write-capable presets as having the full
+  privileges of the proxy user (run in a container / unprivileged user).
+
+## Verification log (P0)
+
+| ID | Question | Result |
+|----|----------|--------|
+| U1 | `confirm_run_command` headless | Confirmed (static): no handler -> deny `run_command`, allow `*` (incl. writes). |
+| U2 | Does `workspaces` confine `allow_all`? | Not provable statically; no Python-side enforcement. README says not to rely on it. **Open** (needs a harness run). |
+| U6 | Empty `app_data_dir` effects | Default is `~/.gemini/antigravity`; Python code only forwards it to the harness. With an API key passed in config nothing in Python reads credentials from it. Go-side use (cache/creds) **unverified**. |
+| U7 | HOME override vs Vertex ADC | `env` is merged over `os.environ` and forwarded in `InputConfig.env`. ADC reads `$HOME/.config/gcloud`, so the proxy keeps the real HOME when no API key is configured and overrides HOME only with an API key. GOOGLE_* is never scrubbed. Harness behaviour **unverified**. |
+| U8 | Termination with allowlist / no subagents | `FINISH` is only the structured-output tool (`get_last_structured_output`); nothing in Python requires it to end a turn, so read-only presets omit it. `CapabilitiesConfig` validators only complain about `max_subagent_depth` / `allowed_subagents` with subagents off. Runtime termination **unverified** (needs a real call). |
+| - | `env=` semantics | Merges (`{**os.environ, **env}`), cannot unset: scrub the process env at startup. |
+| - | `workspaces=None` | Becomes `[os.getcwd()]`: always pass explicit workspaces. |

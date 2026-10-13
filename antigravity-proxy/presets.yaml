@@ -1,53 +1,72 @@
 # agy-proxy agent presets -- your "personal preference of agents".
 #
 # Clients select a preset by putting its name in the request's `model` field
-# (OpenAI: `model`, Anthropic: `model`). Unknown names fall back to `default`.
+# (OpenAI: `model`, Anthropic: `model`). An unknown name is a 404; the `default`
+# preset is used only when the request has no `model` at all.
+#
+# SECURITY: the agent acts with the proxy user's privileges. Tools are an
+# ALLOWLIST (`enabled_tools`). Presets that can write files or run commands need
+# AGY_WORKSPACE (an absolute directory); without it they load disabled.
 #
 # Fields per preset:
-#   description         human note
-#   system_instructions extra system prompt prepended to any client system message
-#   model               underlying Gemini model (default: AGY_DEFAULT_MODEL)
-#   policy              allow_all | safe_defaults | workspace_only | deny_all | confirm_run_command
-#   behavior            autonomous | interactive
-#   thinking_level      minimal | low | medium | high | extra_high   (optional)
-#   enabled_tools       list of BuiltinTools names (omit = all).  Names:
-#                       LIST_DIR SEARCH_DIR FIND_FILE VIEW_FILE CREATE_FILE EDIT_FILE
-#                       RUN_COMMAND ASK_QUESTION START_SUBAGENT GENERATE_IMAGE
-#                       SEARCH_WEB READ_URL_CONTENT FINISH
-#   disabled_tools      list of BuiltinTools names to strip
-#   enable_subagents    true | false
-#   workspaces          list of dirs file tools are restricted to (optional)
+#   description          human note
+#   system_instructions  system prompt for the agent
+#   model                underlying Gemini model (default: AGY_DEFAULT_MODEL)
+#   policy               allow_all | safe_defaults | confirm_run_command | deny_all
+#                        (workspace_only is rejected: the SDK's version denies every file tool)
+#   behavior             autonomous | interactive
+#   thinking_level       minimal | low | medium | high | extra_high   (optional)
+#   enabled_tools        REQUIRED allowlist of BuiltinTools names (omit only with allow_all).
+#                        `[]` = no tools. Names:
+#                        LIST_DIR SEARCH_DIR FIND_FILE VIEW_FILE CREATE_FILE EDIT_FILE
+#                        RUN_COMMAND ASK_QUESTION START_SUBAGENT GENERATE_IMAGE
+#                        SEARCH_WEB READ_URL_CONTENT SCHEDULE FINISH
+#   enable_subagents     true | false (default false)
+#   allow_client_system  true | false (default false): pass the client's system prompt
+#                        to the agent, labelled "[Untrusted client instructions]"
+#   workspaces           extra absolute dirs (default: AGY_WORKSPACE)
+#   enabled              false = load disabled (agy-coder: or set AGY_ENABLE_CODER=1)
 
-default: agy-coder
+default: agy-researcher
 
 presets:
+  agy-researcher:
+    description: Read/search-only analyst; cannot edit files, run shell, or reach the web.
+    system_instructions: >
+      You are a careful researcher. Investigate thoroughly using read and search
+      tools, cite file paths, and summarize findings. Do not modify anything.
+    policy: confirm_run_command
+    behavior: autonomous
+    thinking_level: high
+    enabled_tools: [LIST_DIR, SEARCH_DIR, FIND_FILE, VIEW_FILE]
+
+  agy-light:
+    description: Tool-less, low-latency chat helper (no file, shell, or web access).
+    system_instructions: >
+      You are a concise, fast assistant. Answer directly.
+    policy: deny_all
+    behavior: autonomous
+    thinking_level: minimal
+    allow_client_system: true
+    enabled_tools: []
+
+  # Opt-in: can create/edit files and run shell commands as the proxy user inside
+  # AGY_WORKSPACE (and anywhere else that user can reach -- see README Security).
   agy-coder:
     description: Autonomous coding agent with full toolset and high reasoning.
     system_instructions: >
       You are a senior software engineer. Prefer minimal, correct changes that
       match existing conventions. Verify before claiming done.
+    enabled: false          # or run with AGY_ENABLE_CODER=1; also requires AGY_WORKSPACE
     policy: allow_all
     behavior: autonomous
     thinking_level: high
-
-  agy-researcher:
-    description: Read/search-focused analyst; cannot edit files or run shell.
-    system_instructions: >
-      You are a careful researcher. Investigate thoroughly using read and search
-      tools, cite file paths, and summarize findings. Do not modify anything.
-    policy: safe_defaults
-    behavior: autonomous
-    thinking_level: high
-    disabled_tools:
+    allow_client_system: true
+    enabled_tools:
+      - LIST_DIR
+      - SEARCH_DIR
+      - FIND_FILE
+      - VIEW_FILE
       - CREATE_FILE
       - EDIT_FILE
       - RUN_COMMAND
-
-  agy-fast:
-    description: Low-latency chat/coding helper, minimal thinking, no subagents.
-    system_instructions: >
-      You are a concise, fast assistant. Answer directly.
-    policy: safe_defaults
-    behavior: autonomous
-    thinking_level: minimal
-    enable_subagents: false

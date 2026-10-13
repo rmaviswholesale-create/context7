@@ -28,7 +28,8 @@ Claude Code / Cursor / aider ──▶  agy-proxy  ──▶  google.antigravity
   messages array, like every OpenAI/Anthropic client expects); switches to a
   live, memory-preserving Agent when a client sends a session id.
 - **Faithful streaming.** Reasoning is surfaced (`reasoning_content` / `thinking`
-  blocks) and SDK tool calls are streamed, with spec-correct SSE framing.
+  blocks) with spec-correct SSE framing. The agent runs its own tools server-side;
+  its tool calls are logged, not sent to the client.
 
 ## Install
 
@@ -39,6 +40,45 @@ cd antigravity-proxy
 python -m venv .venv && source .venv/bin/activate
 pip install -e .            # add ".[dev]" for tests
 ```
+
+## Security (read this first)
+
+`agy-proxy` hands requests to an agent that **acts with the privileges of the
+user running the proxy, on the machine running the proxy**. Whoever can send it a
+request can make that agent read files, and (with write presets) change files and
+run commands. Treat it like an SSH login.
+
+- **A token is always required.** If `AGY_PROXY_TOKEN` is unset, a random token is
+  generated at startup and printed once to stderr (loopback binds only). Clients
+  send it as `Authorization: Bearer <token>` or `x-api-key: <token>`. Only
+  `/healthz` (liveness only) is unauthenticated; `/docs` and `/openapi.json` are off.
+- **Localhost only.** Binding to a non-loopback address without an explicit
+  `AGY_PROXY_TOKEN` exits at startup. A token does **not** make a LAN/Internet bind
+  safe: it travels in clear text and the agent has host privileges. If you must
+  expose it, put it behind TLS and a firewall/VPN, set `AGY_ALLOWED_HOSTS`, and run it in a
+  container as an unprivileged user.
+- **DNS rebinding / browsers.** Requests whose `Host` is not in the allowlist
+  (`127.0.0.1`, `localhost`, `[::1]`, plus your bind host; override with
+  `AGY_ALLOWED_HOSTS`) get 403, as does any request carrying an `Origin` header
+  (browsers add it; API clients do not). `POST` bodies must be `application/json`.
+- **Default preset is read-only.** `agy-researcher` can list/search/view files in
+  `AGY_WORKSPACE` and nothing else (no edits, no shell, no web, no subagents).
+  `agy-light` has no tools at all.
+- **`agy-coder` is opt-in** (`AGY_ENABLE_CODER=1` or edit `presets.yaml`) and,
+  like any preset that can write files or run commands, **requires
+  `AGY_WORKSPACE`** (an absolute directory). Without it the preset loads disabled
+  and requests for it get 404. The workspace is the agent's working directory, not a
+  proven sandbox: `agy-coder` can reach anything the proxy user can. Run it in a
+  container or as an unprivileged user with only the data you accept it touching.
+- **Secrets stay out of the agent.** After start-up the proxy removes `AGY_*`,
+  `GEMINI_API_KEY` and `*KEY*`/`*TOKEN*`/`*SECRET*` variables from its own
+  environment (keeping `HOME`, `PATH`, `GOOGLE_*`), so the agent and its shell
+  do not inherit them. Per-agent scratch directories are created and deleted by
+  the proxy.
+- **Unknown model names are a 404**, not a silent fallback; the default preset is
+  used only when a request omits `model`. Client `system` messages are ignored
+  unless the preset sets `allow_client_system: true`, and are then labelled
+  `[Untrusted client instructions]`.
 
 ## Configure
 
@@ -53,14 +93,14 @@ python -m agy_proxy.doctor  # verify the installed SDK matches expectations
 ## Run
 
 ```bash
-python -m agy_proxy          # serves http://127.0.0.1:8081
+python -m agy_proxy          # serves http://127.0.0.1:8081 and prints the token once
 ```
 
 Sanity check:
 
 ```bash
-curl -s localhost:8081/healthz
-curl -s localhost:8081/v1/models        # lists your presets
+curl -s localhost:8081/healthz                                  # {"status":"ok"}
+curl -s localhost:8081/v1/models -H "Authorization: Bearer $AGY_PROXY_TOKEN"
 ```
 
 ## Wire up your client
@@ -69,52 +109,56 @@ curl -s localhost:8081/v1/models        # lists your presets
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8081
-export ANTHROPIC_API_KEY=dummy          # any non-empty string; the proxy uses YOUR Gemini key
-claude --model agy-coder                 # the model name selects a preset
+export ANTHROPIC_API_KEY=<your AGY_PROXY_TOKEN>   # the proxy token; the proxy uses YOUR Gemini key upstream
+claude --model agy-researcher            # the model name selects a preset
 ```
 
 ### OpenAI-compatible tools (Cursor, aider, Zed, …)
 
 ```
 Base URL:  http://127.0.0.1:8081/v1
-API key:   dummy   (unless you set AGY_PROXY_TOKEN — then use that)
-Model:     agy-coder | agy-researcher | agy-fast
+API key:   <your AGY_PROXY_TOKEN>
+Model:     agy-researcher | agy-light   (agy-coder if enabled)
 ```
 
 ```bash
 curl -N localhost:8081/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"agy-coder","stream":true,
+  -H 'content-type: application/json' -H "Authorization: Bearer $AGY_PROXY_TOKEN" \
+  -d '{"model":"agy-researcher","stream":true,
        "messages":[{"role":"user","content":"list the files here"}]}'
 ```
 
 ## Presets — your agents
 
 Edit `presets.yaml`. The `model` field a client sends is matched against preset
-names; unknown names fall back to `default`.
+names; an unknown name is a 404 and `default` applies only when `model` is absent.
 
 ```yaml
-default: agy-coder
+default: agy-researcher
 presets:
-  agy-coder:                      # autonomous, full tools, deep thinking
+  agy-researcher:                 # read/search only
+    policy: confirm_run_command
+    enabled_tools: [LIST_DIR, SEARCH_DIR, FIND_FILE, VIEW_FILE]
+  agy-light:                      # no tools
+    policy: deny_all
+    enabled_tools: []
+  agy-coder:                      # opt-in; needs AGY_WORKSPACE
+    enabled: false                # or AGY_ENABLE_CODER=1
     policy: allow_all
-    thinking_level: high
-  agy-researcher:                 # read/search only, no edits/shell
-    policy: safe_defaults
-    disabled_tools: [CREATE_FILE, EDIT_FILE, RUN_COMMAND]
-  agy-fast:                       # snappy, minimal thinking
-    thinking_level: minimal
-    enable_subagents: false
+    enabled_tools: [LIST_DIR, SEARCH_DIR, FIND_FILE, VIEW_FILE, CREATE_FILE, EDIT_FILE, RUN_COMMAND]
 ```
 
 Fields: `system_instructions`, `model`, `policy`
-(`allow_all` | `safe_defaults` | `workspace_only` | `deny_all` | `confirm_run_command`),
+(`allow_all` | `safe_defaults` | `confirm_run_command` | `deny_all`),
 `behavior` (`autonomous` | `interactive`), `thinking_level`
-(`minimal`…`extra_high`), `enabled_tools` / `disabled_tools` (BuiltinTools names),
-`enable_subagents`, `workspaces`.
+(`minimal`…`extra_high`), `enabled_tools` (required allowlist of BuiltinTools names;
+`[]` = no tools; omit only with `allow_all`), `enable_subagents` (default `false`),
+`allow_client_system` (default `false`), `workspaces`, `enabled`.
+`disabled_tools` was removed (use the allowlist) and `workspace_only` is rejected.
 
-> `agy-proxy` runs headless, so `safe_defaults` maps to "allow all tools but guard
-> shell execution" (there is no human to answer confirm prompts).
+> `agy-proxy` runs headless, so `safe_defaults` / `confirm_run_command` mean "deny
+> shell, allow everything else" -- **including file writes**. The `enabled_tools`
+> allowlist is what makes a preset read-only.
 
 ## Conversation state (auto)
 
@@ -130,8 +174,12 @@ Fields: `system_instructions`, `model`, `policy`
 | Env var | Default | Meaning |
 |---|---|---|
 | `GEMINI_API_KEY` / `AGY_API_KEY` | – | Your key handed to the SDK |
-| `AGY_HOST` / `AGY_PORT` | `127.0.0.1` / `8081` | Bind address |
-| `AGY_PROXY_TOKEN` | – | If set, clients must send it (Bearer / `x-api-key`) |
+| `AGY_HOST` / `AGY_PORT` | `127.0.0.1` / `8081` | Bind address (non-loopback requires `AGY_PROXY_TOKEN`) |
+| `AGY_PROXY_TOKEN` | generated | Token clients must send (Bearer / `x-api-key`); auto-generated and printed once on loopback |
+| `AGY_ALLOWED_HOSTS` | loopback names | Comma-separated accepted `Host` values |
+| `AGY_WORKSPACE` | – | Absolute directory for write-capable presets (required for them) |
+| `AGY_ENABLE_CODER` | `0` | Enable the `agy-coder` preset |
+| `AGY_LOG_TOOLS` | `1` | Log the agent's tool calls (never sent to clients) |
 | `AGY_DEFAULT_MODEL` | `gemini-3-pro` | Model when a preset pins none |
 | `AGY_PRESETS` | `./presets.yaml` | Presets file path |
 | `AGY_SESSION_TTL` / `AGY_SESSION_MAX` | `900` / `64` | Live-agent cache bounds |
@@ -141,15 +189,14 @@ Fields: `system_instructions`, `model`, `policy`
 - `POST /v1/chat/completions` — OpenAI (stream + non-stream)
 - `POST /v1/messages` — Anthropic (stream + non-stream)
 - `GET /v1/models` — presets as models
-- `GET /healthz` — status
+- `GET /healthz` — liveness (the only unauthenticated endpoint)
 
 ## Notes & limits
 
 - Builtin tools (file I/O, shell, search, sub-agents) run **inside** the SDK.
-  The proxy surfaces `ToolCall`/`ToolResult` as informational stream events —
-  clients don't fulfil them.
+  Tool calls are logged and not sent to clients, who cannot fulfil them.
 - Text-only for now; multimodal inputs are on the roadmap.
-- Keep the bind on `127.0.0.1` unless you set `AGY_PROXY_TOKEN`.
+- See **Security** above before changing the bind address or enabling `agy-coder`.
 - This is personal tooling using your own account. Respect Google's and any
   model provider's terms of service.
 

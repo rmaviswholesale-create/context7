@@ -326,6 +326,7 @@ async def _events_for(
 @router.post("/v1/messages")
 async def messages(req: MessagesRequest, request: Request):
     ctx = get_ctx(request)
+    ctx.registry.resolve(req.model)  # unknown model -> 404 before any streaming starts
     model_label = req.model or ctx.registry.default_name
 
     if req.stream:

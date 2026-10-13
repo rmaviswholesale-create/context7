@@ -9,6 +9,8 @@ See ``docs/SDK_NOTES.md`` for the verified SDK surface this relies on.
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -43,23 +45,22 @@ from .events import (
     ToolResultEvent,
 )
 from .presets import Preset, PresetRegistry
+from .scratch import Scratch
+
+logger = logging.getLogger("agy_proxy.runner")
 
 # Policy factories keyed by the friendly name used in presets.yaml.
 #
 # agy-proxy runs headless (no human to answer confirm prompts), so the SDK's
-# interactive ``safe_defaults(handler)`` is unavailable. We map ``safe_defaults``
-# to ``confirm_run_command()`` which -- with no handler -- allows all tools while
-# guarding shell execution, the sensible non-interactive default.
+# interactive ``safe_defaults(handler)`` is unavailable. ``safe_defaults`` therefore maps
+# to ``confirm_run_command()``, which -- with no handler -- denies RUN_COMMAND but
+# ALLOWS everything else, including file writes. The preset's ``enabled_tools``
+# allowlist (plus the explicit deny rules in ``_policies``) is the real barrier.
 _POLICY_FACTORIES = {
-    "allow_all": lambda p: [policy.allow_all()],
-    "deny_all": lambda p: [policy.deny_all()],
-    "safe_defaults": lambda p: list(policy.confirm_run_command()),
-    "confirm_run_command": lambda p: list(policy.confirm_run_command()),
-    "workspace_only": lambda p: (
-        list(policy.workspace_only(p.workspaces))
-        if p.workspaces
-        else list(policy.confirm_run_command())
-    ),
+    "allow_all": lambda: [policy.allow_all()],
+    "deny_all": lambda: [policy.deny_all()],
+    "safe_defaults": lambda: list(policy.confirm_run_command()),
+    "confirm_run_command": lambda: list(policy.confirm_run_command()),
 }
 
 _THINKING_LEVELS = {
@@ -72,7 +73,8 @@ _THINKING_LEVELS = {
 
 
 def _tool_enum(names: list[str] | None) -> list[BuiltinTools] | None:
-    if not names:
+    """Map names to BuiltinTools. ``None`` = SDK defaults; ``[]`` = no tools."""
+    if names is None:
         return None
     out: list[BuiltinTools] = []
     for n in names:
@@ -83,35 +85,81 @@ def _tool_enum(names: list[str] | None) -> list[BuiltinTools] | None:
     return out
 
 
+_WRITE_TOOLS = ("CREATE_FILE", "EDIT_FILE", "RUN_COMMAND")
+_UNTRUSTED_LABEL = "[Untrusted client instructions]"
+
+
 class AgentRunner:
     """Turns resolved presets + messages into a normalized event stream."""
 
-    def __init__(self, registry: PresetRegistry, api_key: str | None):
+    def __init__(
+        self,
+        registry: PresetRegistry,
+        api_key: str | None,
+        workspace: str | None = None,
+    ):
         self._registry = registry
         self._api_key = api_key
+        self._workspace = workspace
 
     # -- configuration -------------------------------------------------------
 
     def build_config(
-        self, preset: Preset, system_extra: str | None = None
+        self,
+        preset: Preset,
+        system_extra: str | None = None,
+        scratch: Scratch | None = None,
     ) -> LocalAgentConfig:
-        """Construct a LocalAgentConfig from a preset (used for both modes)."""
-        system = _join_system(preset.system_instructions, system_extra)
+        """Construct a LocalAgentConfig from a preset (used for both modes).
+
+        ``scratch`` owns save_dir/app_data_dir/HOME/TMPDIR; the caller must call
+        ``scratch.cleanup()`` (a new one is created when omitted).
+        """
+        scratch = scratch or Scratch()
+        system = _join_system(preset, system_extra)
         capabilities = CapabilitiesConfig(
             agent_behavior=AgentBehavior[preset.behavior.upper()],
             enabled_tools=_tool_enum(preset.enabled_tools),
-            disabled_tools=_tool_enum(preset.disabled_tools),
             enable_subagents=preset.enable_subagents,
         )
-        policies = _POLICY_FACTORIES[preset.policy](preset)
         return LocalAgentConfig(
             system_instructions=system,
             capabilities=capabilities,
-            policies=policies,
+            policies=self._policies(preset),
             model=self._build_model(preset),
             api_key=self._api_key,
-            workspaces=preset.workspaces or None,
+            workspaces=self._workspaces(preset, scratch),
+            save_dir=scratch.save_dir,
+            app_data_dir=scratch.app_data_dir,
+            env=self._env(scratch),
         )
+
+    def _workspaces(self, preset: Preset, scratch: Scratch) -> list[str]:
+        """Explicit workspaces (the SDK turns ``None`` into the proxy's cwd)."""
+        if preset.workspaces:
+            return list(preset.workspaces)
+        if self._workspace:
+            return [self._workspace]
+        if preset.needs_workspace:
+            raise ValueError(f"preset {preset.name!r} needs AGY_WORKSPACE")
+        return [scratch.workspace]
+
+    @staticmethod
+    def _policies(preset: Preset) -> list[Any]:
+        policies: list[Any] = []
+        if not preset.needs_workspace:
+            # Defence in depth for read-only presets, on top of the tool allowlist.
+            policies += [policy.deny(BuiltinTools[t].value) for t in _WRITE_TOOLS]
+        policies += _POLICY_FACTORIES[preset.policy]()
+        return policies
+
+    def _env(self, scratch: Scratch) -> dict[str, str]:
+        # The SDK MERGES this into os.environ (it cannot remove variables), so secrets
+        # are scrubbed from the process at startup; here we only redirect scratch space.
+        # With Vertex/ADC (no API key) the real HOME is kept: ADC credentials live there.
+        env = {"PATH": os.environ.get("PATH", os.defpath), "TMPDIR": scratch.tmp}
+        env["HOME"] = scratch.home if self._api_key else os.environ.get("HOME", scratch.home)
+        return env
 
     def _build_model(self, preset: Preset) -> str | ModelTarget:
         model_name = self._registry.effective_model(preset)
@@ -124,8 +172,15 @@ class AgentRunner:
         return model_name
 
     def new_agent(self, preset: Preset, system_extra: str | None = None) -> Agent:
-        """Create an un-entered Agent (caller manages the async context)."""
-        return Agent(self.build_config(preset, system_extra))
+        """Create an un-entered Agent (caller manages the async context and cleanup)."""
+        scratch = Scratch()
+        try:
+            agent = Agent(self.build_config(preset, system_extra, scratch))
+        except BaseException:
+            scratch.cleanup()
+            raise
+        agent.scratch = scratch  # type: ignore[attr-defined]
+        return agent
 
     # -- streaming -----------------------------------------------------------
 
@@ -135,9 +190,14 @@ class AgentRunner:
         """One-shot: build a fresh agent, replay the whole conversation, tear down."""
         system_extra, prompt = flatten_messages(messages)
         agent = self.new_agent(preset, system_extra)
-        async with agent:
-            async for ev in self._run(agent, prompt):
-                yield ev
+        try:
+            async with agent:
+                async for ev in self._run(agent, prompt):
+                    yield ev
+        finally:
+            scratch = getattr(agent, "scratch", None)
+            if scratch is not None:
+                scratch.cleanup()
 
     async def stream_on_agent(
         self, agent: Agent, messages: list[dict[str, str]]
@@ -185,8 +245,20 @@ def _stop_reason(reason: Any) -> str | None:
     return getattr(reason, "name", str(reason))
 
 
-def _join_system(base: str | None, extra: str | None) -> str | None:
-    parts = [p for p in (base, extra) if p]
+def _join_system(preset: Preset, client_system: str | None) -> str | None:
+    """Preset text, plus client system text only when the preset allows it.
+
+    Client text is untrusted: it is labelled and placed BEFORE the preset's own
+    instructions so the preset's rules are the last (most recent) word.
+    """
+    parts: list[str] = []
+    if client_system:
+        if preset.allow_client_system:
+            parts.append(f"{_UNTRUSTED_LABEL}\n{client_system}")
+        else:
+            logger.debug("ignoring client system text for preset %r", preset.name)
+    if preset.system_instructions:
+        parts.append(preset.system_instructions)
     return "\n\n".join(parts) if parts else None
 
 
