@@ -107,7 +107,11 @@ class SessionStore:
                 if self._entries.get(key) is not entry:
                     continue  # retired while we waited: start over
                 if entry.preset_name != preset.name or not self._usable(entry.agent):
-                    self._retire(entry)  # preset changed / harness dead: rebuild
+                    # Preset changed / harness dead: rebuild. We hold the lock, so nobody is
+                    # using the agent (waiters only re-check the index): close it NOW so its
+                    # slot is free for the replacement even with other waiters still pinned.
+                    self._retire(entry)
+                    await self._close_entry(entry)
                     continue
                 self._entries.move_to_end(key)
                 lease = SessionLease(entry.agent, is_new=entry.turns == 0)
@@ -118,6 +122,7 @@ class SessionStore:
                     entry.last_used = time.monotonic()
                     if not lease.completed or not self._usable(entry.agent):
                         self._retire(entry)
+                        await self._close_entry(entry)  # lock held: free the slot for waiters
                 return
             finally:
                 entry.lock.release()

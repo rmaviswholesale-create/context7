@@ -31,7 +31,14 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level,
+        timeout_keep_alive=settings.keepalive_timeout,
+        limit_concurrency=settings.uvicorn_limit_concurrency,
+    )
 
 
 if __name__ == "__main__":

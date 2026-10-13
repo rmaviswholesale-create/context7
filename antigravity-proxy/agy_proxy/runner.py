@@ -93,12 +93,13 @@ class AgentRunner:
         *,
         teardown_timeout: float = 10.0,
         budget: BudgetConfig | None = None,
+        spawn_timeout: float = 30.0,
     ):
         self._registry = registry
         self._api_key = api_key
         self._workspace = workspace
         self._budget = budget
-        self.lifecycle = AgentLifecycle(teardown_timeout)
+        self.lifecycle = AgentLifecycle(teardown_timeout, spawn_timeout=spawn_timeout)
 
     @staticmethod
     def budget_from(max_model_calls: int, max_tool_calls: int) -> BudgetConfig | None:
