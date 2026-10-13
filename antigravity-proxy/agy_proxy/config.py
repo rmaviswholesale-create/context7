@@ -161,6 +161,18 @@ class Settings:
     log_level: str = "info"
     # Extra environment variable names the harness may inherit (AGY_ENV_PASSTHROUGH).
     env_passthrough: tuple[str, ...] = ()
+    # --- P4a runtime hardening (appended block) ---
+    spawn_timeout: int = 30  # seconds the harness gets to complete startup, then kill + 502
+    body_timeout: int = 60  # seconds to receive a request body before 408 (no permit is held)
+    keepalive_timeout: int = 5  # uvicorn timeout_keep_alive (idle keep-alive sockets)
+    limit_concurrency: int = 0  # uvicorn limit_concurrency; 0 = derived (see property)
+    # --- end P4a block ---
+
+    @property
+    def uvicorn_limit_concurrency(self) -> int:
+        """Open-connection cap for uvicorn (503 beyond it); well above the agent cap so cheap
+        endpoints and 429 replies keep working under load."""
+        return self.limit_concurrency or max(32, self.max_concurrency * 8)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -196,4 +208,10 @@ class Settings:
             env_passthrough=tuple(
                 n.strip() for n in env.get("AGY_ENV_PASSTHROUGH", "").split(",") if n.strip()
             ),
+            # --- P4a runtime hardening (appended block) ---
+            spawn_timeout=_int(env, "AGY_SPAWN_TIMEOUT", 30, 1),
+            body_timeout=_int(env, "AGY_BODY_TIMEOUT", 60, 1),
+            keepalive_timeout=_int(env, "AGY_KEEPALIVE_TIMEOUT", 5, 1),
+            limit_concurrency=_int(env, "AGY_LIMIT_CONCURRENCY", 0, 0),
+            # --- end P4a block ---
         )

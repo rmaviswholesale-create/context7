@@ -47,6 +47,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings.api_key,
         settings.workspace,
         teardown_timeout=settings.teardown_timeout,
+        spawn_timeout=settings.spawn_timeout,
         budget=AgentRunner.budget_from(settings.max_model_calls, settings.max_tool_calls),
         env_passthrough=settings.env_passthrough,
     )
@@ -110,7 +111,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # add_middleware stacks outward (last added runs first): Host/Origin, token auth, body
     # cap, then admission -- so unauthenticated traffic never reads a body or takes a slot.
-    admission = Admission(settings.max_concurrency, settings.turn_timeout)
+    admission = Admission(
+        settings.max_concurrency, settings.turn_timeout, body_timeout=settings.body_timeout
+    )
     app.add_middleware(AdmissionMiddleware, admission=admission)
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(TokenAuthMiddleware, token=settings.proxy_token)

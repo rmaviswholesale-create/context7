@@ -64,9 +64,10 @@ class LiveAgentRegistry:
 class Admission:
     """Bounded concurrency: a full house is refused immediately (429), never queued."""
 
-    def __init__(self, max_concurrency: int, turn_timeout: float):
+    def __init__(self, max_concurrency: int, turn_timeout: float, body_timeout: float = 60.0):
         self.max_concurrency = max_concurrency
         self.turn_timeout = turn_timeout
+        self.body_timeout = body_timeout
         self.inflight = 0
 
     def try_enter(self) -> bool:
@@ -102,6 +103,12 @@ class AdmissionMiddleware:
         ):
             await self.app(scope, receive, send)
             return
+        # Read the whole body BEFORE taking a permit: a client that trickles (or never sends)
+        # its body must not occupy one of the few agent slots. BodyLimitMiddleware (outside)
+        # already bounds its size; the deadline bounds its duration.
+        body = await self._read_body(scope, receive, send)
+        if body is None:
+            return
         if not self.admission.try_enter():
             err = RateLimited(
                 f"server is at capacity ({self.admission.max_concurrency} concurrent requests); "
@@ -109,10 +116,40 @@ class AdmissionMiddleware:
             )
             await error_response(err, scope, {"retry-after": "1"})(scope, receive, send)
             return
+        replay = [body]
+
+        async def receive_buffered() -> Message:
+            return replay.pop(0) if replay else await receive()
+
         try:
-            await self._run(scope, receive, send)
+            await self._run(scope, receive_buffered, send)
         finally:
             self.admission.leave()
+
+    async def _read_body(self, scope: Scope, receive: Receive, send: Send) -> Message | None:
+        """The buffered request body as one ASGI message, or None if the response was sent
+        (deadline) or the client went away."""
+        chunks: list[bytes] = []
+        try:
+            async with asyncio.timeout(self.admission.body_timeout):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return None
+                    chunks.append(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:  # builtin: raised by asyncio.timeout
+            logger.warning("request body not received within %ss", self.admission.body_timeout)
+            err = ProxyError(
+                f"request body not received within {self.admission.body_timeout}s",
+                status=408,
+            )
+            err.kind = "invalid_request_error"
+            err.oai_type = "invalid_request_error"
+            await error_response(err, scope, {"connection": "close"})(scope, receive, send)
+            return None
+        return {"type": "http.request", "body": b"".join(chunks), "more_body": False}
 
     async def _run(self, scope: Scope, receive: Receive, send: Send) -> None:
         started = False

@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import stat
-import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -18,33 +15,7 @@ from agy_proxy.presets import PresetRegistry
 from agy_proxy.runner import AgentRunner
 
 PRESETS = str(Path(__file__).resolve().parent.parent / "presets.yaml")
-FAKE = str(Path(__file__).resolve().parent / "fake_localharness.py")
 MSGS = [{"role": "user", "content": "hello"}]
-
-
-@pytest.fixture
-def tmproot(tmp_path, monkeypatch):
-    root = tmp_path / "tmp"
-    root.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(root))
-    return root
-
-
-@pytest.fixture
-def harness(tmp_path, monkeypatch, tmproot):
-    wrapper = tmp_path / "localharness"
-    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}"\n')
-    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
-    pidfile = tmp_path / "pid"
-    monkeypatch.setenv("ANTIGRAVITY_HARNESS_PATH", str(wrapper))
-    monkeypatch.setenv("FAKE_HARNESS_PIDFILE", str(pidfile))
-
-    def mode(name: str) -> Path:
-        monkeypatch.setenv("FAKE_HARNESS_MODE", name)
-        return pidfile
-
-    mode("ok")
-    return mode
 
 
 def make_runner(timeout: float = 2.0) -> tuple[AgentRunner, object]:
@@ -128,8 +99,7 @@ async def test_cancel_during_open_leaves_nothing_behind(harness, tmproot):
             pass
 
     task = asyncio.ensure_future(consume())
-    await asyncio.sleep(0)  # let open_agent start its __aenter__ task
-    await asyncio.sleep(0)
+    await until(pidfile.exists)  # the harness process exists; the open is still in flight
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

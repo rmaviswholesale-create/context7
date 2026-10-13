@@ -46,6 +46,8 @@ def main() -> None:
         port=settings.port,
         log_level=settings.log_level,
         log_config=None,
+        timeout_keep_alive=settings.keepalive_timeout,
+        limit_concurrency=settings.uvicorn_limit_concurrency,
     )
 
 

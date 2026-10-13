@@ -3,9 +3,42 @@
 from __future__ import annotations
 
 import json
+import stat
+import sys
+import tempfile
 from collections.abc import AsyncIterator
+from pathlib import Path
+
+import pytest
 
 from agy_proxy.events import Event
+
+FAKE = str(Path(__file__).resolve().parent / "fake_localharness.py")
+
+
+@pytest.fixture
+def tmproot(tmp_path, monkeypatch):
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
+    return root
+
+
+@pytest.fixture
+def harness(tmp_path, monkeypatch, tmproot):
+    wrapper = tmp_path / "localharness"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE}"\n')
+    wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+    pidfile = tmp_path / "pid"
+    monkeypatch.setenv("ANTIGRAVITY_HARNESS_PATH", str(wrapper))
+    monkeypatch.setenv("FAKE_HARNESS_PIDFILE", str(pidfile))
+
+    def mode(name: str) -> Path:
+        monkeypatch.setenv("FAKE_HARNESS_MODE", name)
+        return pidfile
+
+    mode("ok")
+    return mode
 
 
 async def aiter(events: list[Event]) -> AsyncIterator[Event]:
