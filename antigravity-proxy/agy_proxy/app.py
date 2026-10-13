@@ -5,14 +5,15 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 
 from . import __version__, anthropic_api, openai_api
 from .config import Settings
 from .context import ProxyContext
-from .errors import ProxyError, error_response
+from .errors import install_error_handlers
 from .presets import PresetRegistry
 from .runner import AgentRunner
+from .runner_events import configure as configure_tool_trace
 from .security import (
     HostOriginMiddleware,
     TokenAuthMiddleware,
@@ -29,6 +30,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     assert settings.proxy_token  # ensure_token guarantees one
     # Secrets now live only in Settings; keep them out of the agent's environment.
     scrub_process_env()
+    configure_tool_trace(trace_tools=settings.enable_tool_trace)
 
     registry = PresetRegistry.load(
         settings.presets_path,
@@ -71,9 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         settings=settings, registry=registry, runner=runner, sessions=sessions
     )
 
-    @app.exception_handler(ProxyError)
-    async def _proxy_error(_request: Request, exc: ProxyError):
-        return error_response(exc)
+    install_error_handlers(app)
 
     app.include_router(openai_api.router)
     app.include_router(anthropic_api.router)

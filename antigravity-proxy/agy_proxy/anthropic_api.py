@@ -1,15 +1,17 @@
-"""Anthropic-compatible adapter: /v1/messages.
+"""Anthropic-compatible adapter: /v1/messages and /v1/messages/count_tokens.
 
 This is the endpoint Claude Code points at (``ANTHROPIC_BASE_URL``). It emits the
-exact Messages streaming event sequence Anthropic clients expect:
+Messages streaming event sequence Anthropic clients expect:
 
-    message_start
+    message_start, ping
       (content_block_start / content_block_delta* / content_block_stop)*
     message_delta
     message_stop
 
-Thoughts become ``thinking`` blocks; SDK tool calls become ``tool_use`` blocks;
-visible text becomes ``text`` blocks.
+Thoughts become ``thinking`` blocks (with a signature) and visible text becomes
+``text`` blocks. The agent runs its tools server-side, so there are never ``tool_use``
+blocks; client-supplied ``tools`` are ignored (and flagged via ``x-agy-ignored``).
+A failure mid-stream is an ``event: error`` frame, after which the stream closes.
 """
 
 from __future__ import annotations
@@ -21,325 +23,187 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
 
-from .context import ProxyContext, get_ctx
-from .events import (
-    DoneEvent,
-    ErrorEvent,
-    Event,
-    TextEvent,
-    ThoughtEvent,
-    ToolCallEvent,
+from .context import get_ctx
+from .errors import sse_error_frame
+from .events import DoneEvent, ErrorEvent, Event, TextEvent, ThoughtEvent, finish_kind
+from .messages import (
+    MessagesRequest,
+    NormalizedRequest,
+    collect,
+    events_for,
+    guarded,
+    normalize_anthropic,
+    prime,
+    route_preset,
+    thinking_signature,
 )
 
 router = APIRouter()
 
-
-class AnthropicMessage(BaseModel):
-    role: str
-    content: Any = None  # str | list[blocks]
-
-
-class MessagesRequest(BaseModel):
-    model: str | None = None
-    messages: list[AnthropicMessage]
-    system: Any = None  # str | list[{type:text,text}]
-    max_tokens: int | None = None
-    stream: bool = False
-
-
-def _text_from_blocks(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out: list[str] = []
-        for b in content:
-            if isinstance(b, str):
-                out.append(b)
-            elif isinstance(b, dict):
-                t = b.get("type")
-                if t == "text":
-                    out.append(b.get("text", ""))
-                elif t == "tool_result":
-                    out.append(_text_from_blocks(b.get("content")))
-        return "".join(out)
-    return str(content)
-
-
-def _system_text(system: Any) -> str:
-    if not system:
-        return ""
-    if isinstance(system, str):
-        return system
-    if isinstance(system, list):
-        return "".join(
-            b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text"
-        )
-    return str(system)
-
-
-def _normalize(req: MessagesRequest) -> list[dict[str, str]]:
-    msgs: list[dict[str, str]] = []
-    sys = _system_text(req.system)
-    if sys:
-        msgs.append({"role": "system", "content": sys})
-    for m in req.messages:
-        msgs.append({"role": m.role, "content": _text_from_blocks(m.content)})
-    return msgs
-
-
-def _stop_reason(stop: str | None) -> str:
-    if stop and ("MAX" in stop or "EXCEEDED" in stop):
-        return "max_tokens"
-    return "end_turn"
+_STOP = {"stop": "end_turn", "length": "max_tokens"}
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _stream_anthropic(events: AsyncIterator[Event], model: str) -> AsyncIterator[str]:
-    mid = f"msg_{uuid.uuid4().hex}"
+def _block_start(index: int, block: dict[str, Any]) -> str:
+    return _sse(
+        "content_block_start",
+        {"type": "content_block_start", "index": index, "content_block": block},
+    )
+
+
+def _block_delta(index: int, delta: dict[str, Any]) -> str:
+    return _sse(
+        "content_block_delta", {"type": "content_block_delta", "index": index, "delta": delta}
+    )
+
+
+def _block_stop(index: int) -> str:
+    return _sse("content_block_stop", {"type": "content_block_stop", "index": index})
+
+
+async def _stream_anthropic(
+    events: AsyncIterator[Event], model: str, input_tokens: int = 0
+) -> AsyncIterator[str]:
     yield _sse(
         "message_start",
         {
             "type": "message_start",
             "message": {
-                "id": mid,
+                "id": f"msg_{uuid.uuid4().hex}",
                 "type": "message",
                 "role": "assistant",
                 "model": model,
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
         },
     )
+    yield _sse("ping", {"type": "ping"})
 
     index = -1
-    open_kind: str | None = None  # "text" | "thinking" | "tool_use"
+    open_kind: str | None = None  # "text" | "thinking"
+    thinking: list[str] = []
+    emitted_chars = 0
 
-    def close_block() -> str | None:
+    def close_block() -> str:
         nonlocal open_kind
-        if open_kind is not None:
-            out = _sse("content_block_stop", {"type": "content_block_stop", "index": index})
-            open_kind = None
-            return out
-        return None
+        if open_kind is None:
+            return ""
+        out = ""
+        if open_kind == "thinking":
+            sig = {"type": "signature_delta", "signature": thinking_signature("".join(thinking))}
+            out += _block_delta(index, sig)
+            thinking.clear()
+        out += _block_stop(index)
+        open_kind = None
+        return out
 
-    stop_reason = "end_turn"
-    out_tokens = None
-    async for ev in events:
-        if isinstance(ev, TextEvent):
-            if open_kind != "text":
+    async for ev in guarded(events):
+        if isinstance(ev, TextEvent | ThoughtEvent):
+            kind = "text" if isinstance(ev, TextEvent) else "thinking"
+            if open_kind != kind:
                 closed = close_block()
                 if closed:
                     yield closed
                 index += 1
-                open_kind = "text"
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "text_delta", "text": ev.text},
-                },
-            )
-        elif isinstance(ev, ThoughtEvent):
-            if open_kind != "thinking":
-                closed = close_block()
-                if closed:
-                    yield closed
-                index += 1
-                open_kind = "thinking"
-                yield _sse(
-                    "content_block_start",
-                    {
-                        "type": "content_block_start",
-                        "index": index,
-                        "content_block": {"type": "thinking", "thinking": ""},
-                    },
-                )
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {"type": "thinking_delta", "thinking": ev.text},
-                },
-            )
-        elif isinstance(ev, ToolCallEvent):
-            closed = close_block()
-            if closed:
-                yield closed
-            index += 1
-            open_kind = "tool_use"
-            yield _sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": ev.id or f"toolu_{uuid.uuid4().hex[:12]}",
-                        "name": ev.name,
-                        "input": {},
-                    },
-                },
-            )
-            yield _sse(
-                "content_block_delta",
-                {
-                    "type": "content_block_delta",
-                    "index": index,
-                    "delta": {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(ev.args, ensure_ascii=False),
-                    },
-                },
-            )
-            closed = close_block()
-            if closed:
-                yield closed
+                open_kind = kind
+                if kind == "text":
+                    yield _block_start(index, {"type": "text", "text": ""})
+                else:
+                    yield _block_start(index, {"type": "thinking", "thinking": "", "signature": ""})
+            emitted_chars += len(ev.text)
+            if kind == "text":
+                yield _block_delta(index, {"type": "text_delta", "text": ev.text})
+            else:
+                thinking.append(ev.text)
+                yield _block_delta(index, {"type": "thinking_delta", "thinking": ev.text})
         elif isinstance(ev, ErrorEvent):
             closed = close_block()
             if closed:
                 yield closed
-            yield _sse(
-                "error",
-                {"type": "error", "error": {"type": ev.type, "message": ev.message}},
-            )
+            yield sse_error_frame(ev.error, anthropic=True)
             return
         elif isinstance(ev, DoneEvent):
-            stop_reason = _stop_reason(ev.stop_reason)
-            out_tokens = ev.output_tokens
-
-    closed = close_block()
-    if closed:
-        yield closed
-    yield _sse(
-        "message_delta",
-        {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": out_tokens or 0},
-        },
-    )
-    yield _sse("message_stop", {"type": "message_stop"})
-
-
-async def _collect_anthropic(events: AsyncIterator[Event], model: str) -> dict[str, Any]:
-    content: list[dict[str, Any]] = []
-    text_buf: list[str] = []
-    think_buf: list[str] = []
-    stop_reason = "end_turn"
-    usage_in = usage_out = None
-
-    def flush_text() -> None:
-        if text_buf:
-            content.append({"type": "text", "text": "".join(text_buf)})
-            text_buf.clear()
-
-    def flush_think() -> None:
-        if think_buf:
-            content.append({"type": "thinking", "thinking": "".join(think_buf)})
-            think_buf.clear()
-
-    async for ev in events:
-        if isinstance(ev, TextEvent):
-            flush_think()
-            text_buf.append(ev.text)
-        elif isinstance(ev, ThoughtEvent):
-            flush_text()
-            think_buf.append(ev.text)
-        elif isinstance(ev, ToolCallEvent):
-            flush_think()
-            flush_text()
-            content.append(
+            closed = close_block()
+            if closed:
+                yield closed
+            if index < 0:  # empty response: clients expect at least one content block
+                yield _block_start(0, {"type": "text", "text": ""})
+                yield _block_stop(0)
+            usage: dict[str, int] = {
+                "output_tokens": ev.output_tokens or max(1, emitted_chars // 4)
+            }
+            if ev.input_tokens:
+                usage["input_tokens"] = ev.input_tokens
+            yield _sse(
+                "message_delta",
                 {
-                    "type": "tool_use",
-                    "id": ev.id or f"toolu_{uuid.uuid4().hex[:12]}",
-                    "name": ev.name,
-                    "input": ev.args,
-                }
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": _STOP[finish_kind(ev.stop_reason)],
+                        "stop_sequence": None,
+                    },
+                    "usage": usage,
+                },
             )
-        elif isinstance(ev, ErrorEvent):
-            raise _AdapterError(ev.message, ev.type)
-        elif isinstance(ev, DoneEvent):
-            stop_reason = _stop_reason(ev.stop_reason)
-            usage_in, usage_out = ev.input_tokens, ev.output_tokens
-    flush_think()
-    flush_text()
+            yield _sse("message_stop", {"type": "message_stop"})
+            return
 
+
+async def _collect_anthropic(
+    events: AsyncIterator[Event], model: str, input_tokens: int = 0
+) -> dict[str, Any]:
+    done = await collect(events, input_tokens)
+    content: list[dict[str, Any]] = []
+    for kind, text in done.segments:
+        if kind == "thinking":
+            content.append(
+                {"type": "thinking", "thinking": text, "signature": thinking_signature(text)}
+            )
+        else:
+            content.append({"type": "text", "text": text})
     return {
         "id": f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": "assistant",
         "model": model,
         "content": content or [{"type": "text", "text": ""}],
-        "stop_reason": stop_reason,
+        "stop_reason": _STOP[finish_kind(done.stop_reason)],
         "stop_sequence": None,
-        "usage": {"input_tokens": usage_in or 0, "output_tokens": usage_out or 0},
+        "usage": {"input_tokens": done.input_tokens, "output_tokens": done.output_tokens},
     }
 
 
-class _AdapterError(Exception):
-    def __init__(self, message: str, type_: str):
-        super().__init__(message)
-        self.type = type_
-
-
-def _session_id(request: Request) -> str | None:
-    return request.headers.get("x-agy-session") or request.headers.get("x-session-id")
-
-
-async def _events_for(
-    ctx: ProxyContext, req: MessagesRequest, request: Request
-) -> AsyncIterator[Event]:
-    preset = ctx.registry.resolve(req.model)
-    messages = _normalize(req)
-    sid = _session_id(request)
-    if sid:
-        from .runner import flatten_messages
-
-        system_extra, _ = flatten_messages(messages)
-        async with ctx.sessions.acquire(sid, preset, system_extra) as agent:
-            async for ev in ctx.runner.stream_on_agent(agent, messages):
-                yield ev
-    else:
-        async for ev in ctx.runner.stream_stateless(preset, messages):
-            yield ev
+def _stream_headers(norm: NormalizedRequest) -> dict[str, str]:
+    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **norm.response_headers()}
 
 
 @router.post("/v1/messages")
 async def messages(req: MessagesRequest, request: Request):
     ctx = get_ctx(request)
-    ctx.registry.resolve(req.model)  # unknown model -> 404 before any streaming starts
-    model_label = req.model or ctx.registry.default_name
+    norm = normalize_anthropic(req)
+    preset = route_preset(ctx.registry, norm.model, norm.max_tokens)  # 404 before streaming
+    model_label = req.model or preset.name
+    events = events_for(ctx, norm, request)
 
-    if req.stream:
+    if norm.stream:
+        primed = await prime(events)  # start-up failures become real HTTP errors
         return StreamingResponse(
-            _stream_anthropic(_events_for(ctx, req, request), model_label),
+            _stream_anthropic(primed, model_label, norm.input_tokens),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=_stream_headers(norm),
         )
-    try:
-        body = await _collect_anthropic(_events_for(ctx, req, request), model_label)
-    except _AdapterError as exc:
-        return JSONResponse(
-            status_code=502,
-            content={"type": "error", "error": {"type": exc.type, "message": str(exc)}},
-        )
-    return JSONResponse(body)
+    body = await _collect_anthropic(events, model_label, norm.input_tokens)
+    return JSONResponse(body, headers=norm.response_headers())
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(req: MessagesRequest, request: Request):
+    norm = normalize_anthropic(req, require_prompt=False)
+    return JSONResponse({"input_tokens": norm.input_tokens}, headers=norm.response_headers())

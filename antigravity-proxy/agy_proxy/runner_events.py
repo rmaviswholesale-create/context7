@@ -1,30 +1,42 @@
 """Maps the SDK's ``ChatResponse.chunks`` stream onto the normalized events.
 
 Split out of ``runner.py`` so the event mapping can be tested (and evolve)
-independently of agent spawn/teardown.
+independently of agent spawn/teardown. Tool calls and results are executed by the
+agent itself and are never part of the wire protocol: they are only logged, and
+only when tool tracing is enabled (``AGY_LOG_TOOLS``).
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
 from google.antigravity import BuiltinTools
 from google.antigravity.types import Text, Thought, ToolCall, ToolResult
 
-from .events import (
-    DoneEvent,
-    ErrorEvent,
-    Event,
-    TextEvent,
-    ThoughtEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-)
+from .errors import RateLimited
+from .events import DoneEvent, ErrorEvent, Event, TextEvent, ThoughtEvent
+
+logger = logging.getLogger("agy_proxy.runner")
+tool_logger = logging.getLogger("agy_proxy.tools")
+
+_trace_tools = True
+_CUT_SHORT = frozenset({"MAX_MODEL_CALLS_EXCEEDED", "MAX_TOOL_CALLS_EXCEEDED"})
+
+
+def configure(*, trace_tools: bool) -> None:
+    """Enable or disable logging of the agent's tool activity."""
+    global _trace_tools
+    _trace_tools = trace_tools
 
 
 async def run_chat(agent: Any, prompt: str) -> AsyncIterator[Event]:
-    """Send ``prompt`` to an open agent and yield normalized events."""
+    """Send ``prompt`` to an open agent and yield normalized events.
+
+    Always ends with exactly one terminal event (Done or Error) unless the consumer
+    stops early. QUOTA_EXHAUSTED becomes a RateLimited error instead of a Done.
+    """
     try:
         resp = await agent.chat(prompt)
         async for chunk in resp.chunks:
@@ -35,19 +47,30 @@ async def run_chat(agent: Any, prompt: str) -> AsyncIterator[Event]:
                 if chunk.text:
                     yield ThoughtEvent(chunk.text)
             elif isinstance(chunk, ToolCall):
-                yield ToolCallEvent(
-                    name=tool_name(chunk.name), args=dict(chunk.args or {}), id=chunk.id
-                )
+                if _trace_tools:
+                    tool_logger.info("tool call: %s id=%s", tool_name(chunk.name), chunk.id)
             elif isinstance(chunk, ToolResult):
-                yield ToolResultEvent(name=tool_name(chunk.name), id=chunk.id, error=chunk.error)
+                if _trace_tools:
+                    tool_logger.info(
+                        "tool result: %s id=%s error=%s",
+                        tool_name(chunk.name),
+                        chunk.id,
+                        bool(chunk.error),
+                    )
+        reason = stop_reason_name(getattr(resp, "stop_reason", None))
+        if reason == "QUOTA_EXHAUSTED":
+            yield ErrorEvent(RateLimited("upstream model quota exhausted"))
+            return
+        if reason in _CUT_SHORT:
+            logger.warning("turn cut short by agent budget: %s", reason)
         usage = getattr(resp, "usage_metadata", None)
         yield DoneEvent(
-            stop_reason=stop_reason_name(getattr(resp, "stop_reason", None)),
+            stop_reason=reason,
             input_tokens=getattr(usage, "prompt_token_count", None),
             output_tokens=getattr(usage, "candidates_token_count", None),
         )
     except Exception as exc:  # noqa: BLE001 - surface any SDK failure to the client
-        yield ErrorEvent(message=str(exc) or repr(exc), type=type(exc).__name__)
+        yield ErrorEvent.of(exc)
 
 
 def tool_name(name: Any) -> str:

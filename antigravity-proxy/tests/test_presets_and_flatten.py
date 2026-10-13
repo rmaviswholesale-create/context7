@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from agy_proxy.errors import UnknownModelError
+from agy_proxy.messages import flatten_messages, latest_user_text
 from agy_proxy.presets import PresetRegistry
-from agy_proxy.runner import flatten_messages, latest_user_text
 
 PRESETS = str(Path(__file__).resolve().parent.parent / "presets.yaml")
 
@@ -112,9 +112,9 @@ def test_flatten_multiturn_transcript():
         {"role": "user", "content": "three"},
     ]
     _, prompt = flatten_messages(msgs)
-    assert "User: one" in prompt
-    assert "Assistant: two" in prompt
-    assert "User: three" in prompt
+    assert "User:\n    one" in prompt
+    assert "Assistant:\n    two" in prompt
+    assert "User:\n    three" in prompt
 
 
 def test_latest_user_text():

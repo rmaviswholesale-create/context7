@@ -30,6 +30,7 @@ from google.antigravity.models import (
 from google.antigravity.types import AgentBehavior
 
 from .events import Event
+from .messages import flatten_messages, latest_user_text
 from .presets import Preset, PresetRegistry
 from .runner_events import run_chat
 from .scratch import Scratch
@@ -213,49 +214,3 @@ def _join_system(preset: Preset, client_system: str | None) -> str | None:
     if preset.system_instructions:
         parts.append(preset.system_instructions)
     return "\n\n".join(parts) if parts else None
-
-
-# -- message flattening ------------------------------------------------------
-
-
-def _msg_text(m: dict[str, str]) -> str:
-    return (m.get("content") or "").strip()
-
-
-def latest_user_text(messages: list[dict[str, str]]) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            return _msg_text(m)
-    # Fallback: last message of any role.
-    return _msg_text(messages[-1]) if messages else ""
-
-
-def flatten_messages(messages: list[dict[str, str]]) -> tuple[str | None, str]:
-    """Split messages into (extra system text, prompt).
-
-    System messages are folded into the system instructions. When there is a
-    single user turn, the prompt is just that text. With prior turns, a labelled
-    transcript is built so a fresh (stateless) agent has the full context.
-    """
-    system_parts = [_msg_text(m) for m in messages if m.get("role") == "system"]
-    convo = [m for m in messages if m.get("role") in ("user", "assistant", "tool")]
-    system_extra = "\n\n".join(p for p in system_parts if p) or None
-
-    if not convo:
-        return system_extra, ""
-    if len(convo) == 1 and convo[0].get("role") == "user":
-        return system_extra, _msg_text(convo[0])
-
-    lines: list[str] = []
-    for m in convo:
-        role = m.get("role")
-        label = {"user": "User", "assistant": "Assistant", "tool": "Tool"}.get(role, role)
-        text = _msg_text(m)
-        if text:
-            lines.append(f"{label}: {text}")
-    transcript = "\n\n".join(lines)
-    prompt = (
-        "Continue this conversation. Respond only as the assistant's next turn.\n\n"
-        + transcript
-    )
-    return system_extra, prompt
