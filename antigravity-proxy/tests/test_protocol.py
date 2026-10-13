@@ -249,7 +249,8 @@ def test_openai_empty_response_content_is_empty_string(mk):
 
 def test_non_stream_thinking_block_is_signed(mk):
     c = mk(ScriptedRunner(events=[ThoughtEvent("t"), TextEvent("a"), DoneEvent()]))
-    blocks = c.post("/v1/messages", json=ANT, headers=H).json()["content"]
+    body = {**ANT, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+    blocks = c.post("/v1/messages", json=body, headers=H).json()["content"]
     assert [b["type"] for b in blocks] == ["thinking", "text"]
     assert blocks[0]["signature"]
 
@@ -286,7 +287,7 @@ def test_max_tokens_truncates_text(mk):
         ("claude-3-5-haiku-20241022", 4096, "agy-light"),
         ("claude-sonnet-4", 1, "agy-light"),
         ("claude-sonnet-4", 64, "agy-light"),
-        (None, 10, "agy-light"),
+        (None, 10, "agy-researcher"),  # no model: default preset, tiny or not
         ("agy-researcher", 10, "agy-researcher"),  # explicit preset name wins
         (None, 1000, "agy-researcher"),
     ],
@@ -343,20 +344,12 @@ def test_empty_prompt_is_400_before_any_spawn(mk, path, messages):
 @pytest.mark.parametrize(
     "path, messages",
     [
-        (
-            "/v1/chat/completions",
-            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
-        ),
         ("/v1/chat/completions", [{"role": "narrator", "content": "x"}]),
-        (
-            "/v1/messages",
-            [{"role": "user", "content": [{"type": "image", "source": {"type": "base64"}}]}],
-        ),
         ("/v1/messages", [{"role": "system", "content": "x"}]),
         ("/v1/messages", [{"role": "user", "content": [{"type": "mystery"}]}]),
     ],
 )
-def test_unsupported_media_and_roles_are_400(mk, path, messages):
+def test_unsupported_roles_and_blocks_are_400(mk, path, messages):
     r = ScriptedRunner(events=OK)
     body = {"model": "agy-researcher", "max_tokens": 100, "messages": messages}
     assert mk(r).post(path, json=body, headers=H).status_code == 400

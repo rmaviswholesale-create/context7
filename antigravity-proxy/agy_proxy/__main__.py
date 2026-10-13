@@ -9,9 +9,15 @@ import uvicorn
 
 from .app import create_app
 from .config import ConfigError, Settings
+from .redact import install_log_redaction, register_secrets
+from .security import adopt_inherited_secrets, reexec_clean
 
 
 def main() -> None:
+    # Re-exec once with an environment that holds no secrets (they travel through a pipe),
+    # so /proc/<pid>/environ of the serving process cannot leak them to the agent's shell.
+    reexec_clean()
+    adopt_inherited_secrets()
     try:
         settings = Settings.from_env()
     except ConfigError as exc:
@@ -20,6 +26,8 @@ def main() -> None:
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    register_secrets(settings.api_key, settings.proxy_token)
+    install_log_redaction()
     app = create_app(settings)
     token = app.state.ctx.settings.proxy_token
     if app.state.ctx.settings.token_generated:
@@ -31,7 +39,14 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
-    uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level)
+    # log_config=None: uvicorn's loggers propagate to the (redacting) root handler.
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        log_level=settings.log_level,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":

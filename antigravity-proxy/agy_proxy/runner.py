@@ -36,6 +36,7 @@ from .messages import flatten_messages
 from .presets import Preset, PresetRegistry
 from .runner_events import run_chat
 from .scratch import Scratch
+from .security import env_allowed
 from .sessionkey import select_turn_messages
 
 logger = logging.getLogger("agy_proxy.runner")
@@ -93,7 +94,9 @@ class AgentRunner:
         *,
         teardown_timeout: float = 10.0,
         budget: BudgetConfig | None = None,
+        env_passthrough: tuple[str, ...] = (),
     ):
+        self._env_extra = env_passthrough
         self._registry = registry
         self._api_key = api_key
         self._workspace = workspace
@@ -174,10 +177,16 @@ class AgentRunner:
         return policies
 
     def _env(self, scratch: Scratch) -> dict[str, str]:
-        # The SDK MERGES this into os.environ (it cannot remove variables), so secrets
-        # are scrubbed from the process at startup; here we only redirect scratch space.
-        # With Vertex/ADC (no API key) the real HOME is kept: ADC credentials live there.
-        env = {"PATH": os.environ.get("PATH", os.defpath), "TMPDIR": scratch.tmp}
+        """Harness environment, built from an ALLOWLIST (see ``security.env_allowed``).
+
+        The SDK still MERGES this over ``os.environ`` (it cannot remove variables), so the
+        proxy process itself is scrubbed to the same allowlist at startup; building the dict
+        explicitly keeps the intent independent of that and of anything set later.
+        With Vertex/ADC (no API key) the real HOME is kept: ADC credentials live there.
+        """
+        env = {k: v for k, v in os.environ.items() if env_allowed(k, self._env_extra)}
+        env.setdefault("PATH", os.defpath)
+        env["TMPDIR"] = scratch.tmp
         env["HOME"] = scratch.home if self._api_key else os.environ.get("HOME", scratch.home)
         return env
 

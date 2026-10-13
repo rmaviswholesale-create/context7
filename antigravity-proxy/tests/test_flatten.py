@@ -120,7 +120,7 @@ async def test_events_for_uses_session_when_id_given():
     )
     runner, sessions = _Runner(), _Sessions()
     ctx = SimpleNamespace(
-        registry=reg, runner=runner, sessions=sessions, settings=SimpleNamespace(proxy_token="tok")
+        registry=reg, runner=runner, sessions=sessions, settings=SimpleNamespace(proxy_token="tok", turn_timeout=600)
     )
     norm = NormalizedRequest(
         protocol="anthropic",
@@ -153,7 +153,7 @@ async def test_events_for_ignores_legacy_session_ids():
         registry=reg,
         runner=_Stateless(),
         sessions=_Sessions(),
-        settings=SimpleNamespace(proxy_token="tok"),
+        settings=SimpleNamespace(proxy_token="tok", turn_timeout=600),
     )
     norm = NormalizedRequest(
         protocol="openai", model="agy-researcher", messages=[u("q")], user="someone"

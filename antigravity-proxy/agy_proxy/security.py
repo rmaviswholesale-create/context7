@@ -9,12 +9,13 @@ streaming responses and run before any body is parsed.
 from __future__ import annotations
 
 import hmac
+import json
 import os
-import re
 import secrets
-from collections.abc import Iterable, MutableMapping
+import sys
+from collections.abc import Iterable, Mapping, MutableMapping
 
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings, is_loopback_host
 from .errors import (
@@ -24,13 +25,59 @@ from .errors import (
     UnsupportedMediaType,
     error_response,
 )
+from .redact import new_request_id, request_id_var
 
 # The only unauthenticated path; it reveals nothing but liveness.
 OPEN_PATHS = frozenset({"/healthz"})
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
-_SECRET_NAME = re.compile(r"(KEY|TOKEN|SECRET)", re.IGNORECASE)
-_KEEP_EXACT = frozenset({"HOME", "PATH"})
+# Variables the harness (and any shell it runs) may inherit. Everything else is removed
+# from the proxy process once Settings has captured the configuration.
+CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "LANG",
+        "TMPDIR",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_GENAI_USE_VERTEXAI",
+    }
+)
+CHILD_ENV_PREFIXES = ("LC_",)
+# Needed so the harness can reach the network through an egress proxy / custom CA.
+# (Proxy URLs may embed credentials: drop them with AGY_ENV_PASSTHROUGH unset and
+# configure egress another way if that matters.)
+NETWORK_ENV = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+# Interpreter / process plumbing that is harmless and expected to be present.
+_RUNTIME_ENV = frozenset(
+    {"USER", "LOGNAME", "SHELL", "TERM", "TZ", "VIRTUAL_ENV", "LD_LIBRARY_PATH"}
+)
+
+
+def env_allowed(name: str, extra: Iterable[str] = ()) -> bool:
+    upper = name.upper()
+    return (
+        upper in CHILD_ENV_ALLOWLIST
+        or upper in NETWORK_ENV
+        or upper in _RUNTIME_ENV
+        or upper.startswith(CHILD_ENV_PREFIXES)
+        or upper.startswith("PYTHON")
+        or upper in {e.upper() for e in extra}
+    )
 
 
 def make_token() -> str:
@@ -51,33 +98,120 @@ def check_bind(host: str, token: str | None) -> None:
         )
 
 
-def scrub_process_env(environ: MutableMapping[str, str] | None = None) -> list[str]:
-    """Remove secrets from the process environment; returns the names removed.
+def scrub_process_env(
+    environ: MutableMapping[str, str] | None = None, extra: Iterable[str] = ()
+) -> list[str]:
+    """Remove everything but an allowlist from the process environment; returns the names removed.
 
     The SDK merges ``os.environ`` into the harness environment, so the only way to keep
-    the API key and proxy token away from the agent (and any shell it runs) is to
-    drop them from this process once Settings has captured them. HOME, PATH and
-    GOOGLE_* (ADC / Vertex configuration) are kept.
+    the API key, the proxy token and unrelated secrets (cloud credentials, database URLs,
+    ``SSH_AUTH_SOCK``...) away from the agent and any shell it spawns is to drop them from
+    this process once Settings has captured what it needs. ``extra`` adds operator-chosen
+    names (``AGY_ENV_PASSTHROUGH``).
+
+    Caveat: this edits the live environment only. ``/proc/<pid>/environ`` of this process
+    still shows the block it was started with, readable by the same user (so by the agent's
+    shell). ``__main__`` therefore re-execs with a clean environment; see :func:`reexec_clean`.
     """
     environ = os.environ if environ is None else environ
     removed: list[str] = []
     for name in list(environ):
-        upper = name.upper()
-        if upper in _KEEP_EXACT or upper.startswith("GOOGLE_"):
-            continue
-        if upper.startswith("AGY_") or upper == "GEMINI_API_KEY" or _SECRET_NAME.search(upper):
+        if not env_allowed(name, extra):
             environ.pop(name, None)
             removed.append(name)
     return removed
 
 
-def _host_only(value: str) -> str:
-    """Strip an optional port from a Host header value (IPv6 literals keep brackets)."""
+# -- re-exec with a clean environment ----------------------------------------------------
+
+SECRET_VARS = ("AGY_PROXY_TOKEN", "AGY_API_KEY", "GEMINI_API_KEY")
+_CLEAN_MARK = "AGY_ENV_CLEAN"
+_FD_VAR = "AGY_SECRETS_FD"
+
+
+def split_secrets(environ: Mapping[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """(clean environment for the new process, secrets to hand over out-of-band)."""
+    secret_vals = {k: environ[k] for k in SECRET_VARS if environ.get(k)}
+    extra = [e.strip() for e in environ.get("AGY_ENV_PASSTHROUGH", "").split(",") if e.strip()]
+    clean = {
+        k: v
+        for k, v in environ.items()
+        if k not in SECRET_VARS and (env_allowed(k, extra) or k.upper().startswith("AGY_"))
+    }
+    return clean, secret_vals
+
+
+def reexec_clean(
+    argv: list[str] | None = None, environ: Mapping[str, str] | None = None
+) -> None:
+    """Replace this process with a copy whose environment holds no secrets.
+
+    The secrets travel through an inherited pipe (never on disk, argv or environ) and are
+    read once by :func:`adopt_inherited_secrets`. Only returns when re-exec is disabled or
+    already done (``AGY_ENV_CLEAN`` marker / ``AGY_NO_REEXEC=1``).
+    """
+    environ = os.environ if environ is None else environ
+    if environ.get(_CLEAN_MARK) or environ.get("AGY_NO_REEXEC", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return
+    clean, secret_vals = split_secrets(environ)
+    clean[_CLEAN_MARK] = "1"
+    if secret_vals:
+        payload = json.dumps(secret_vals).encode()
+        r, w = os.pipe()
+        if len(payload) > 32_000:  # must fit the pipe buffer: we write before exec
+            raise SystemExit("refusing to re-exec: secrets too large")
+        os.write(w, payload)
+        os.close(w)
+        os.set_inheritable(r, True)
+        clean[_FD_VAR] = str(r)
+    args = argv or [sys.executable, "-m", "agy_proxy"]
+    os.execve(args[0], args, clean)
+
+
+def adopt_inherited_secrets(environ: MutableMapping[str, str] | None = None) -> bool:
+    """Read the secrets pipe left by :func:`reexec_clean` into ``environ`` (then close it)."""
+    environ = os.environ if environ is None else environ
+    raw_fd = environ.pop(_FD_VAR, None)
+    if not raw_fd or not raw_fd.isdigit():
+        return False
+    fd = int(raw_fd)
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            data = json.loads(fh.read() or b"{}")
+    except (OSError, ValueError):
+        return False
+    for k, v in data.items():
+        if k in SECRET_VARS and isinstance(v, str):
+            environ[k] = v
+    return True
+
+
+def _host_only(value: str) -> str | None:
+    """Host without its port; ``None`` when the value is malformed (non-numeric port...).
+
+    IPv6 literals keep their brackets. A port, when present, must be 1-5 digits.
+    """
     v = value.strip().lower()
     if v.startswith("["):
         end = v.find("]")
-        return v[: end + 1] if end != -1 else v
-    return v.rsplit(":", 1)[0] if v.count(":") == 1 else v
+        if end == -1:
+            return None
+        rest = v[end + 1 :]
+        if rest and not (rest.startswith(":") and _valid_port(rest[1:])):
+            return None
+        return v[: end + 1]
+    if v.count(":") == 1:
+        host, port = v.rsplit(":", 1)
+        return host if _valid_port(port) else None
+    return v
+
+
+def _valid_port(port: str) -> bool:
+    return port.isascii() and port.isdigit() and 0 < int(port) <= 65535
 
 
 def _media_type(value: str) -> str:
@@ -107,14 +241,15 @@ class HostOriginMiddleware:
 
     def __init__(self, app: ASGIApp, allowed_hosts: Iterable[str]):
         self.app = app
-        self.allowed = frozenset(_host_only(h) for h in allowed_hosts)
+        self.allowed = frozenset(h for h in (_host_only(x) for x in allowed_hosts) if h)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
         h = _headers(scope)
-        if _host_only(h.get("host", "")) not in self.allowed:
+        host = _host_only(h.get("host", ""))
+        if host is None or host not in self.allowed:
             await _reject(scope, receive, send, ForbiddenError("host not allowed"))
             return
         # Browsers always attach Origin to cross-site POSTs; API clients never do.
@@ -176,3 +311,38 @@ def ensure_token(settings: Settings) -> Settings:
     if settings.proxy_token:
         return settings
     return replace(settings, proxy_token=make_token(), token_generated=True)
+
+
+class RequestIdMiddleware:
+    """Outermost layer: a fresh correlation id on every response (``x-request-id``).
+
+    Client-supplied ids are never trusted or echoed (log injection). The id is also
+    placed in a context variable so error bodies, SSE error frames and server logs
+    carry the same value.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        rid = new_request_id()
+        token = request_id_var.set(rid)
+
+        async def send_w(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, v)
+                    for k, v in message.get("headers", [])
+                    if k.lower() not in (b"x-request-id", b"request-id")
+                ]
+                headers += [(b"x-request-id", rid.encode()), (b"request-id", rid.encode())]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_w)
+        finally:
+            request_id_var.reset(token)

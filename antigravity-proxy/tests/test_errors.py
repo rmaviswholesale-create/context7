@@ -158,5 +158,6 @@ def test_agent_exception_message_is_sanitized_and_typed(tmp_path):
     with build(tmp_path, ScriptedRunner(exc=ValueError("harness exploded"))) as c:
         r = c.post(OAI[0], json=OAI[1], headers=H)
         assert_openai(r, 502, "server_error", None)
-        assert "harness exploded" in r.json()["error"]["message"]
+        assert r.json()["error"]["message"] == "upstream error"
+        assert "harness exploded" not in r.text
         assert "ValueError" not in r.text

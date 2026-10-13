@@ -33,6 +33,9 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+# Large enough for long agentic transcripts (Claude Code resends the whole history).
+DEFAULT_MAX_BODY = 32 * 1024 * 1024
+
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off", ""}
 
@@ -62,16 +65,52 @@ def _int(env: Mapping[str, str], name: str, default: int, minimum: int = 0) -> i
     return val
 
 
-def _workspace(env: Mapping[str, str]) -> str | None:
-    raw = (env.get("AGY_WORKSPACE") or "").strip()
-    if not raw:
-        return None
+def _home_dirs(env: Mapping[str, str] | None = None) -> set[Path]:
+    """Every plausible 'home' of the proxy user (real paths)."""
+    homes = {Path.home()}
+    if env and env.get("HOME"):
+        homes.add(Path(env["HOME"]))
+    try:
+        import pwd
+
+        homes.add(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (ImportError, KeyError):
+        pass
+    return {h.resolve() for h in homes if str(h)}
+
+
+def broad_workspace_reason(path: str | Path, env: Mapping[str, str] | None = None) -> str | None:
+    """Why ``path`` is too broad to be a workspace (``/``, the home dir or an ancestor)."""
+    real = Path(path).resolve()
+    if real == Path(real.anchor):
+        return "the filesystem root"
+    for home in _home_dirs(env):
+        if real == home:
+            return f"the home directory {str(home)!r}"
+        if real in home.parents:
+            return f"a parent of the home directory {str(home)!r}"
+    return None
+
+
+def check_workspace_path(raw: str, label: str, env: Mapping[str, str] | None = None) -> str:
+    """Validate a workspace path and return its resolved form (symlinks followed)."""
     path = Path(raw)
     if not path.is_absolute():
-        raise ConfigError(f"AGY_WORKSPACE={raw!r} must be an absolute path")
+        raise ConfigError(f"{label}={raw!r} must be an absolute path")
     if not path.is_dir():
-        raise ConfigError(f"AGY_WORKSPACE={raw!r} is not an existing directory")
+        raise ConfigError(f"{label}={raw!r} is not an existing directory")
+    broad = broad_workspace_reason(path, env)
+    if broad:
+        resolved = f" (resolves to {str(path.resolve())!r})" if path.resolve() != path else ""
+        raise ConfigError(
+            f"{label}={raw!r}{resolved} is {broad}: choose a dedicated project directory"
+        )
     return str(path.resolve())
+
+
+def _workspace(env: Mapping[str, str]) -> str | None:
+    raw = (env.get("AGY_WORKSPACE") or "").strip()
+    return check_workspace_path(raw, "AGY_WORKSPACE", env) if raw else None
 
 
 def _hosts(env: Mapping[str, str], bind_host: str) -> tuple[str, ...]:
@@ -114,12 +153,14 @@ class Settings:
     # P2 runtime limits.
     max_concurrency: int = 4  # concurrent completions in flight; the next one gets 429
     turn_timeout: int = 600  # seconds for one request, then 504
-    max_body_bytes: int = 1_048_576  # request body cap, then 413
+    max_body_bytes: int = DEFAULT_MAX_BODY  # request body cap, then 413
     teardown_timeout: int = 10  # seconds a harness gets to exit before SIGTERM/SIGKILL
     # Per-request agent budget (0 disables); long-lived session agents get a scaled budget.
     max_model_calls: int = 25
     max_tool_calls: int = 50
     log_level: str = "info"
+    # Extra environment variable names the harness may inherit (AGY_ENV_PASSTHROUGH).
+    env_passthrough: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -147,9 +188,12 @@ class Settings:
             session_max=_int(env, "AGY_SESSION_MAX", 64, 1),
             max_concurrency=_int(env, "AGY_MAX_CONCURRENCY", 4, 1),
             turn_timeout=_int(env, "AGY_TURN_TIMEOUT", 600, 1),
-            max_body_bytes=_int(env, "AGY_MAX_BODY", 1_048_576, 1024),
+            max_body_bytes=_int(env, "AGY_MAX_BODY", DEFAULT_MAX_BODY, 1024),
             teardown_timeout=_int(env, "AGY_TEARDOWN_TIMEOUT", 10, 1),
             max_model_calls=_int(env, "AGY_MAX_MODEL_CALLS", 25, 0),
             max_tool_calls=_int(env, "AGY_MAX_TOOL_CALLS", 50, 0),
             log_level=env.get("AGY_LOG_LEVEL", "info"),
+            env_passthrough=tuple(
+                n.strip() for n in env.get("AGY_ENV_PASSTHROUGH", "").split(",") if n.strip()
+            ),
         )
