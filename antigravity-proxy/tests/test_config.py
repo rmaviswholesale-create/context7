@@ -57,3 +57,17 @@ def test_flags_and_hosts():
     assert s.enable_coder and not s.enable_tool_trace
     assert s.allowed_hosts == ("a.example", "b")
     assert "127.0.0.1" in Settings.from_env({}).allowed_hosts
+
+
+@pytest.mark.parametrize("path", ["/home", "/usr", "/etc", "/tmp"])
+def test_top_level_system_dirs_rejected_as_workspace(path):
+    from agy_proxy.config import broad_workspace_reason
+
+    assert broad_workspace_reason(path) is not None
+
+
+def test_harness_override_survives_env_allowlist():
+    from agy_proxy.security import env_allowed
+
+    assert env_allowed("ANTIGRAVITY_HARNESS_PATH")
+    assert not env_allowed("SOME_SECRET_THING")

@@ -65,6 +65,9 @@ NETWORK_ENV = frozenset(
 # Interpreter / process plumbing that is harmless and expected to be present.
 _RUNTIME_ENV = frozenset(
     {"USER", "LOGNAME", "SHELL", "TERM", "TZ", "VIRTUAL_ENV", "LD_LIBRARY_PATH"}
+    # Operator-chosen harness binary override. Stripping it would silently fall back to
+    # the bundled real harness, which defeats a deliberately configured stand-in.
+    | {"ANTIGRAVITY_HARNESS_PATH"}
 )
 
 

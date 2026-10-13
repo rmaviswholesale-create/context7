@@ -79,11 +79,19 @@ def _home_dirs(env: Mapping[str, str] | None = None) -> set[Path]:
     return {h.resolve() for h in homes if str(h)}
 
 
+_SYSTEM_TOP_DIRS = frozenset(
+    {"home", "root", "usr", "etc", "var", "bin", "sbin", "lib", "lib64", "opt", "srv", "mnt",
+     "media", "boot", "dev", "proc", "sys", "run", "tmp", "Users", "System", "Library"}
+)
+
+
 def broad_workspace_reason(path: str | Path, env: Mapping[str, str] | None = None) -> str | None:
     """Why ``path`` is too broad to be a workspace (``/``, the home dir or an ancestor)."""
     real = Path(path).resolve()
     if real == Path(real.anchor):
         return "the filesystem root"
+    if len(real.parts) == 2 and real.parts[1] in _SYSTEM_TOP_DIRS:
+        return f"the system directory {str(real)!r}"
     for home in _home_dirs(env):
         if real == home:
             return f"the home directory {str(home)!r}"
