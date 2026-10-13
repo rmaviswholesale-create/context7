@@ -96,7 +96,10 @@ async def _reject(scope: Scope, receive: Receive, send: Send, err: ProxyError) -
         await send({"type": "websocket.close", "code": 1008})
         return
     headers = {"www-authenticate": "Bearer"} if isinstance(err, AuthError) else None
-    await error_response(err, headers)(scope, receive, send)
+    request_headers = _headers(scope)
+    await error_response(err, scope.get("path", ""), request_headers, headers)(
+        scope, receive, send
+    )
 
 
 class HostOriginMiddleware:

@@ -27,24 +27,12 @@ from google.antigravity.models import (
     ModelTarget,
     ThinkingLevel,
 )
-from google.antigravity.types import (
-    AgentBehavior,
-    Text,
-    Thought,
-    ToolCall,
-    ToolResult,
-)
+from google.antigravity.types import AgentBehavior
 
-from .events import (
-    DoneEvent,
-    ErrorEvent,
-    Event,
-    TextEvent,
-    ThoughtEvent,
-    ToolCallEvent,
-    ToolResultEvent,
-)
+from .events import Event
+from .messages import flatten_messages, latest_user_text
 from .presets import Preset, PresetRegistry
+from .runner_events import run_chat
 from .scratch import Scratch
 
 logger = logging.getLogger("agy_proxy.runner")
@@ -207,42 +195,8 @@ class AgentRunner:
         async for ev in self._run(agent, prompt):
             yield ev
 
-    async def _run(self, agent: Agent, prompt: str) -> AsyncIterator[Event]:
-        try:
-            resp = await agent.chat(prompt)
-            async for chunk in resp.chunks:
-                if isinstance(chunk, Text):
-                    if chunk.text:
-                        yield TextEvent(chunk.text)
-                elif isinstance(chunk, Thought):
-                    if chunk.text:
-                        yield ThoughtEvent(chunk.text)
-                elif isinstance(chunk, ToolCall):
-                    yield ToolCallEvent(
-                        name=_tool_name(chunk.name), args=dict(chunk.args or {}), id=chunk.id
-                    )
-                elif isinstance(chunk, ToolResult):
-                    yield ToolResultEvent(
-                        name=_tool_name(chunk.name), id=chunk.id, error=chunk.error
-                    )
-            usage = getattr(resp, "usage_metadata", None)
-            yield DoneEvent(
-                stop_reason=_stop_reason(getattr(resp, "stop_reason", None)),
-                input_tokens=getattr(usage, "prompt_token_count", None),
-                output_tokens=getattr(usage, "candidates_token_count", None),
-            )
-        except Exception as exc:  # noqa: BLE001 - surface any SDK failure to the client
-            yield ErrorEvent(message=str(exc) or repr(exc), type=type(exc).__name__)
-
-
-def _tool_name(name: Any) -> str:
-    return name.name if isinstance(name, BuiltinTools) else str(name)
-
-
-def _stop_reason(reason: Any) -> str | None:
-    if reason is None:
-        return None
-    return getattr(reason, "name", str(reason))
+    def _run(self, agent: Agent, prompt: str) -> AsyncIterator[Event]:
+        return run_chat(agent, prompt)
 
 
 def _join_system(preset: Preset, client_system: str | None) -> str | None:
@@ -260,49 +214,3 @@ def _join_system(preset: Preset, client_system: str | None) -> str | None:
     if preset.system_instructions:
         parts.append(preset.system_instructions)
     return "\n\n".join(parts) if parts else None
-
-
-# -- message flattening ------------------------------------------------------
-
-
-def _msg_text(m: dict[str, str]) -> str:
-    return (m.get("content") or "").strip()
-
-
-def latest_user_text(messages: list[dict[str, str]]) -> str:
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            return _msg_text(m)
-    # Fallback: last message of any role.
-    return _msg_text(messages[-1]) if messages else ""
-
-
-def flatten_messages(messages: list[dict[str, str]]) -> tuple[str | None, str]:
-    """Split messages into (extra system text, prompt).
-
-    System messages are folded into the system instructions. When there is a
-    single user turn, the prompt is just that text. With prior turns, a labelled
-    transcript is built so a fresh (stateless) agent has the full context.
-    """
-    system_parts = [_msg_text(m) for m in messages if m.get("role") == "system"]
-    convo = [m for m in messages if m.get("role") in ("user", "assistant", "tool")]
-    system_extra = "\n\n".join(p for p in system_parts if p) or None
-
-    if not convo:
-        return system_extra, ""
-    if len(convo) == 1 and convo[0].get("role") == "user":
-        return system_extra, _msg_text(convo[0])
-
-    lines: list[str] = []
-    for m in convo:
-        role = m.get("role")
-        label = {"user": "User", "assistant": "Assistant", "tool": "Tool"}.get(role, role)
-        text = _msg_text(m)
-        if text:
-            lines.append(f"{label}: {text}")
-    transcript = "\n\n".join(lines)
-    prompt = (
-        "Continue this conversation. Respond only as the assistant's next turn.\n\n"
-        + transcript
-    )
-    return system_extra, prompt

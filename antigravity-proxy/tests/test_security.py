@@ -100,7 +100,10 @@ def test_post_must_be_json(client):
 @pytest.mark.parametrize("path, body", [("/v1/chat/completions", OAI), ("/v1/messages", ANT)])
 @pytest.mark.parametrize("stream", [False, True])
 def test_unknown_model_is_404(client, path, body, stream):
-    r = client.post(path, json={**body, "model": "gpt-4o", "stream": stream}, headers=_auth())
+    big = {**body, "model": "gpt-4o", "stream": stream}
+    if "max_tokens" in big:
+        big["max_tokens"] = 1024  # tiny max_tokens would route to agy-light instead
+    r = client.post(path, json=big, headers=_auth())
     assert r.status_code == 404
     assert client.app.state.ctx.runner.calls == 0
 
