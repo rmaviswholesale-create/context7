@@ -32,6 +32,8 @@ from .events import (
     ThoughtEvent,
     ToolCallEvent,
 )
+from .sessionkey import session_key_from_headers
+from .sessions import stream_session_turn
 
 router = APIRouter()
 
@@ -302,7 +304,7 @@ class _AdapterError(Exception):
 
 
 def _session_id(request: Request) -> str | None:
-    return request.headers.get("x-agy-session") or request.headers.get("x-session-id")
+    return session_key_from_headers(get_ctx(request).settings.proxy_token or "", request.headers)
 
 
 async def _events_for(
@@ -315,9 +317,10 @@ async def _events_for(
         from .runner import flatten_messages
 
         system_extra, _ = flatten_messages(messages)
-        async with ctx.sessions.acquire(sid, preset, system_extra) as agent:
-            async for ev in ctx.runner.stream_on_agent(agent, messages):
-                yield ev
+        async for ev in stream_session_turn(
+            ctx.runner, ctx.sessions, sid, preset, messages, system_extra
+        ):
+            yield ev
     else:
         async for ev in ctx.runner.stream_stateless(preset, messages):
             yield ev

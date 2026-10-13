@@ -50,3 +50,29 @@ def error_response(err: ProxyError, headers: dict[str, str] | None = None) -> JS
     """Render ``err`` as a JSON response (the one place P1 will replace)."""
     body = {"error": {"type": err.kind, "message": err.message, "param": err.param}}
     return JSONResponse(status_code=err.status, content=body, headers=headers)
+
+
+# ---- P2 additions (runtime/lifecycle): keep this block self-contained for merging -------
+
+
+class PayloadTooLarge(ProxyError):
+    status = 413
+    kind = "request_too_large"
+
+
+class RateLimited(ProxyError):
+    status = 429
+    kind = "rate_limit_error"
+
+
+class OverloadedError(ProxyError):
+    status = 429
+    kind = "overloaded_error"
+
+
+class TimeoutError(ProxyError):  # noqa: A001 - intentionally shadows the builtin (see design)
+    status = 504
+    kind = "api_error"
+
+
+# ---- end P2 additions -------------------------------------------------------------------
