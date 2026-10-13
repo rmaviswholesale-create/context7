@@ -37,6 +37,7 @@ from .messages import (
     prime,
     route_preset,
     thinking_signature,
+    tools_token_estimate,
 )
 
 router = APIRouter()
@@ -66,7 +67,10 @@ def _block_stop(index: int) -> str:
 
 
 async def _stream_anthropic(
-    events: AsyncIterator[Event], model: str, input_tokens: int = 0
+    events: AsyncIterator[Event],
+    model: str,
+    input_tokens: int = 0,
+    want_thinking: bool = True,
 ) -> AsyncIterator[str]:
     yield _sse(
         "message_start",
@@ -105,6 +109,9 @@ async def _stream_anthropic(
         return out
 
     async for ev in guarded(events):
+        if isinstance(ev, ThoughtEvent) and not want_thinking:
+            emitted_chars += len(ev.text)  # still counted in the usage estimate
+            continue
         if isinstance(ev, TextEvent | ThoughtEvent):
             kind = "text" if isinstance(ev, TextEvent) else "thinking"
             if open_kind != kind:
@@ -157,12 +164,14 @@ async def _stream_anthropic(
 
 
 async def _collect_anthropic(
-    events: AsyncIterator[Event], model: str, input_tokens: int = 0
+    events: AsyncIterator[Event], model: str, input_tokens: int = 0, want_thinking: bool = True
 ) -> dict[str, Any]:
     done = await collect(events, input_tokens)
     content: list[dict[str, Any]] = []
     for kind, text in done.segments:
         if kind == "thinking":
+            if not want_thinking:
+                continue
             content.append(
                 {"type": "thinking", "thinking": text, "signature": thinking_signature(text)}
             )
@@ -180,8 +189,12 @@ async def _collect_anthropic(
     }
 
 
-def _stream_headers(norm: NormalizedRequest) -> dict[str, str]:
-    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **norm.response_headers()}
+def _stream_headers(norm: NormalizedRequest, preset: str) -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        **norm.response_headers(preset),
+    }
 
 
 @router.post("/v1/messages")
@@ -195,15 +208,16 @@ async def messages(req: MessagesRequest, request: Request):
     if norm.stream:
         primed = await prime(events)  # start-up failures become real HTTP errors
         return StreamingResponse(
-            _stream_anthropic(primed, model_label, norm.input_tokens),
+            _stream_anthropic(primed, model_label, norm.input_tokens, norm.want_thinking),
             media_type="text/event-stream",
-            headers=_stream_headers(norm),
+            headers=_stream_headers(norm, preset.name),
         )
-    body = await _collect_anthropic(events, model_label, norm.input_tokens)
-    return JSONResponse(body, headers=norm.response_headers())
+    body = await _collect_anthropic(events, model_label, norm.input_tokens, norm.want_thinking)
+    return JSONResponse(body, headers=norm.response_headers(preset.name))
 
 
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(req: MessagesRequest, request: Request):
     norm = normalize_anthropic(req, require_prompt=False)
-    return JSONResponse({"input_tokens": norm.input_tokens}, headers=norm.response_headers())
+    total = norm.input_tokens + tools_token_estimate(req)  # system is already in the prompt
+    return JSONResponse({"input_tokens": total}, headers=norm.response_headers())

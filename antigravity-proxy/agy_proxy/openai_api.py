@@ -60,6 +60,7 @@ async def _stream_openai(
     model: str,
     include_usage: bool = False,
     input_tokens: int = 0,
+    want_thinking: bool = True,
 ) -> AsyncIterator[str]:
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     base: dict[str, Any] = {
@@ -82,8 +83,9 @@ async def _stream_openai(
             emitted_chars += len(ev.text)
             yield chunk({"content": ev.text})
         elif isinstance(ev, ThoughtEvent):
-            emitted_chars += len(ev.text)
-            yield chunk({"reasoning_content": ev.text})
+            emitted_chars += len(ev.text)  # counted in usage even when not sent
+            if want_thinking:
+                yield chunk({"reasoning_content": ev.text})
         elif isinstance(ev, ErrorEvent):
             yield sse_error_frame(ev.error, anthropic=False)
             yield _DONE
@@ -99,11 +101,11 @@ async def _stream_openai(
 
 
 async def _collect_openai(
-    events: AsyncIterator[Event], model: str, input_tokens: int = 0
+    events: AsyncIterator[Event], model: str, input_tokens: int = 0, want_thinking: bool = True
 ) -> dict[str, Any]:
     done = await collect(events, input_tokens)
     message: dict[str, Any] = {"role": "assistant", "content": done.text}
-    if done.thinking:
+    if done.thinking and want_thinking:
         message["reasoning_content"] = done.thinking
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -117,8 +119,12 @@ async def _collect_openai(
     }
 
 
-def _stream_headers(norm: NormalizedRequest) -> dict[str, str]:
-    return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no", **norm.response_headers()}
+def _stream_headers(norm: NormalizedRequest, preset: str) -> dict[str, str]:
+    return {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        **norm.response_headers(preset),
+    }
 
 
 @router.post("/v1/chat/completions")
@@ -132,12 +138,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if norm.stream:
         primed = await prime(events)  # start-up failures become real HTTP errors
         return StreamingResponse(
-            _stream_openai(primed, model_label, norm.include_usage, norm.input_tokens),
+            _stream_openai(
+                primed, model_label, norm.include_usage, norm.input_tokens, norm.want_thinking
+            ),
             media_type="text/event-stream",
-            headers=_stream_headers(norm),
+            headers=_stream_headers(norm, preset.name),
         )
-    body = await _collect_openai(events, model_label, norm.input_tokens)
-    return JSONResponse(body, headers=norm.response_headers())
+    body = await _collect_openai(events, model_label, norm.input_tokens, norm.want_thinking)
+    return JSONResponse(body, headers=norm.response_headers(preset.name))
 
 
 # -- models ------------------------------------------------------------------

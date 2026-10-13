@@ -164,7 +164,24 @@ def test_create_app_scrubs_environment(monkeypatch, tmp_path):
 
 
 def test_scrub_process_env_unit():
-    env = {"PATH": "/bin", "HOME": "/h", "GOOGLE_API_KEY": "x", "AGY_X": "1", "FOO_KEY": "2", "OK": "3"}
+    env = {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GOOGLE_CLOUD_PROJECT": "p",
+        "GOOGLE_API_KEY": "x",
+        "AGY_X": "1",
+        "FOO_KEY": "2",
+        "OK": "3",
+        "DATABASE_URL": "pg://u:p@h",
+    }
     removed = scrub_process_env(env)
-    assert env == {"PATH": "/bin", "HOME": "/h", "GOOGLE_API_KEY": "x", "OK": "3"}
-    assert sorted(removed) == ["AGY_X", "FOO_KEY"]
+    assert env == {
+        "PATH": "/bin",
+        "HOME": "/h",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GOOGLE_CLOUD_PROJECT": "p",
+    }
+    assert sorted(removed) == ["AGY_X", "DATABASE_URL", "FOO_KEY", "GOOGLE_API_KEY", "OK"]

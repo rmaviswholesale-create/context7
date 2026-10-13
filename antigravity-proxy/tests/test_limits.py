@@ -65,6 +65,7 @@ class RecordingSessions:
 
 
 def make_app(tmp_path, **kw):
+    kw.setdefault("max_body_bytes", 1024 * 1024)  # the shipped default is 32 MiB
     settings = Settings(
         proxy_token=TOKEN, workspace=str(tmp_path), api_key="k", **kw
     )
@@ -303,7 +304,7 @@ def test_p2_config_defaults_and_validation():
     assert (s.max_concurrency, s.turn_timeout, s.max_body_bytes, s.teardown_timeout) == (
         4,
         600,
-        1_048_576,
+        32 * 1024 * 1024,
         10,
     )
     assert Settings.from_env({"AGY_PROXY_TOKEN": "t", "AGY_MAX_CONCURRENCY": "2"}).max_concurrency == 2

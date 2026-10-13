@@ -42,6 +42,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from .redact import current_request_id, log_failure
+
 logger = logging.getLogger("agy_proxy.errors")
 
 
@@ -52,6 +54,7 @@ class ProxyError(Exception):
     kind: str = "api_error"  # Anthropic error type
     oai_type: str = "server_error"
     oai_code: str | None = None
+    retry_after: int = 30  # seconds, sent as ``retry-after`` on 429/529
 
     def __init__(
         self,
@@ -142,9 +145,10 @@ def to_proxy_error(exc: BaseException) -> ProxyError:
     """Convert any exception into a client-safe :class:`ProxyError`."""
     if isinstance(exc, ProxyError):
         return exc
-    logger.warning("upstream failure: %r", exc, exc_info=exc)
-    text = " ".join(str(exc).split())[:300]
-    return UpstreamError(f"agent failure: {text}" if text else "agent failure")
+    # The client only ever sees a generic message plus the correlation id; the detail
+    # (redacted) goes to the server log under that id.
+    log_failure(logger, "upstream failure", exc)
+    return UpstreamError("upstream error")
 
 
 # -- rendering -------------------------------------------------------------
@@ -159,17 +163,26 @@ def wants_anthropic(path: str, request_headers: Mapping[str, str] | None = None)
     return False
 
 
-def error_payload(err: ProxyError, anthropic: bool) -> dict[str, Any]:
+def error_payload(
+    err: ProxyError, anthropic: bool, request_id: str | None = None
+) -> dict[str, Any]:
+    rid = request_id or current_request_id()
     if anthropic:
-        return {"type": "error", "error": {"type": err.kind, "message": err.message}}
-    return {
-        "error": {
-            "message": err.message,
-            "type": err.oai_type,
-            "param": err.param,
-            "code": err.oai_code,
+        body: dict[str, Any] = {
+            "type": "error",
+            "error": {"type": err.kind, "message": err.message},
         }
+        if rid:
+            body["request_id"] = rid
+        return body
+    error: dict[str, Any] = {
+        "message": err.message,
+        "type": err.oai_type,
+        "param": err.param,
+        "code": err.oai_code,
     }
+    # OpenAI's error object has a fixed shape: its correlation id is the x-request-id header.
+    return {"error": error}
 
 
 def error_response(
@@ -180,7 +193,10 @@ def error_response(
 ) -> JSONResponse:
     """Render ``err`` as a JSON response in the protocol implied by ``path``/headers."""
     body = error_payload(err, wants_anthropic(path, request_headers))
-    return JSONResponse(status_code=err.status, content=body, headers=headers)
+    out = dict(headers or {})
+    if err.status in (429, 529) and not any(k.lower() == "retry-after" for k in out):
+        out["retry-after"] = str(err.retry_after)
+    return JSONResponse(status_code=err.status, content=body, headers=out or None)
 
 
 def sse_error_frame(err: ProxyError, anthropic: bool) -> str:

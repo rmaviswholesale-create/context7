@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import textwrap
@@ -24,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Request
 from pydantic import BaseModel
 
-from .errors import InvalidRequest, UpstreamError, to_proxy_error
+from .errors import GatewayTimeout, InvalidRequest, UpstreamError, to_proxy_error
 from .events import DoneEvent, ErrorEvent, Event, TextEvent, ThoughtEvent
 from .presets import Preset, PresetRegistry
 from .sessionkey import session_key_from_headers
@@ -36,6 +37,9 @@ if TYPE_CHECKING:
 LIGHT_PRESET = "agy-light"
 TINY_MAX_TOKENS = 64
 IGNORED_HEADER = "x-agy-ignored"
+PRESET_HEADER = "x-agy-preset"
+# Only Anthropic-style names get the light-routing heuristic (Claude Code's haiku/title calls).
+LIGHT_MODEL_PREFIX = "claude-"
 
 # -- wire request models ---------------------------------------------------
 
@@ -60,6 +64,7 @@ class ChatCompletionRequest(BaseModel):
     functions: Any = None
     stream_options: dict[str, Any] | None = None
     user: str | None = None
+    reasoning_effort: str | None = None
 
 
 class AnthropicMessage(BaseModel):
@@ -75,6 +80,7 @@ class MessagesRequest(BaseModel):
     stream: bool = False
     tools: Any = None
     tool_choice: Any = None
+    thinking: Any = None
 
 
 # -- normalized request ----------------------------------------------------
@@ -91,9 +97,14 @@ class NormalizedRequest:
     include_usage: bool = False
     user: str | None = None
     input_tokens: int = 0  # estimate
+    # The client asked for reasoning (Anthropic ``thinking`` / OpenAI ``reasoning_effort``);
+    # otherwise thought deltas are dropped from the wire (still counted in usage).
+    want_thinking: bool = False
 
-    def response_headers(self) -> dict[str, str]:
+    def response_headers(self, preset: str | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
+        if preset:
+            headers[PRESET_HEADER] = preset
         if self.ignored_tools:
             headers[IGNORED_HEADER] = "tools"
         return headers
@@ -123,6 +134,16 @@ def _check_max_tokens(value: int | None, param: str) -> int | None:
 # -- OpenAI ----------------------------------------------------------------
 
 
+_OPENAI_MEDIA = {
+    "image_url": "image",
+    "input_image": "image",
+    "input_audio": "audio",
+    "audio": "audio",
+    "file": "file",
+    "input_file": "file",
+}
+
+
 def _openai_content(content: Any, param: str) -> str:
     if content is None:
         return ""
@@ -134,14 +155,13 @@ def _openai_content(content: Any, param: str) -> str:
     for i, part in enumerate(content):
         if isinstance(part, str):
             out.append(part)
-        elif isinstance(part, dict) and part.get("type") == "text":
+        elif isinstance(part, dict) and part.get("type") in ("text", "input_text"):
             out.append(str(part.get("text") or ""))
+        elif isinstance(part, dict) and part.get("type") in _OPENAI_MEDIA:
+            out.append(f"[{_OPENAI_MEDIA[part['type']]} omitted]")
         else:
             kind = part.get("type") if isinstance(part, dict) else type(part).__name__
-            raise _bad(
-                f"unsupported content part {str(kind)!r}: only text input is supported",
-                f"{param}[{i}]",
-            )
+            raise _bad(f"unsupported content part {str(kind)!r}", f"{param}[{i}]")
     return "\n".join(out)
 
 
@@ -189,11 +209,28 @@ def normalize_openai(req: ChatCompletionRequest) -> NormalizedRequest:
         ignored_tools=bool(req.tools or req.functions or req.tool_choice),
         include_usage=bool(req.stream and stream_opts.get("include_usage")),
         user=req.user,
+        want_thinking=bool(req.reasoning_effort) and req.reasoning_effort != "none",
     )
     return _finish(norm, require_prompt=True)
 
 
 # -- Anthropic -------------------------------------------------------------
+
+
+_OMITTED_BLOCKS = {
+    "image": "image",
+    "document": "document",
+    "audio": "audio",
+    "video": "video",
+    "container_upload": "file",
+    "server_tool_use": "server_tool_use",
+    "web_search_tool_result": "web_search_tool_result",
+    "web_fetch_tool_result": "web_fetch_tool_result",
+    "code_execution_tool_result": "code_execution_tool_result",
+    "mcp_tool_use": "mcp_tool_use",
+    "mcp_tool_result": "mcp_tool_result",
+    "search_result": "search_result",
+}
 
 
 def _anthropic_blocks(content: Any, param: str, *, in_result: bool = False) -> str:
@@ -224,11 +261,24 @@ def _anthropic_blocks(content: Any, param: str, *, in_result: bool = False) -> s
             out.append(f"{head}\n{inner}" if inner else head)
         elif kind in ("thinking", "redacted_thinking"):
             continue  # reasoning from earlier turns carries no instructions
-        elif kind in ("image", "document", "audio", "video"):
-            raise _bad(f"{kind} input is not supported: only text input is supported", where)
+        elif kind in _OMITTED_BLOCKS or kind in ("tool_use", "tool_result"):
+            # Media and server-side tool traffic cannot reach a text-only agent; a
+            # placeholder keeps the conversation valid for clients that resend history.
+            out.append(f"[{_OMITTED_BLOCKS.get(kind, kind)} omitted]")
         else:
             raise _bad(f"unsupported content block type {str(kind)!r}", where)
     return "\n".join(out)
+
+
+def _wants_thinking(thinking: Any) -> bool:
+    return isinstance(thinking, dict) and thinking.get("type") not in (None, "disabled")
+
+
+def tools_token_estimate(req: MessagesRequest) -> int:
+    """Rough size of the (otherwise ignored) tool definitions, for count_tokens only."""
+    if not req.tools:
+        return 0
+    return estimate_tokens(_json(req.tools))
 
 
 def normalize_anthropic(req: MessagesRequest, *, require_prompt: bool = True) -> NormalizedRequest:
@@ -252,8 +302,10 @@ def normalize_anthropic(req: MessagesRequest, *, require_prompt: bool = True) ->
         stream=req.stream,
         max_tokens=max_tokens,
         ignored_tools=bool(req.tools or req.tool_choice),
+        want_thinking=_wants_thinking(req.thinking),
     )
-    return _finish(norm, require_prompt=require_prompt)
+    norm = _finish(norm, require_prompt=require_prompt)
+    return norm
 
 
 def _finish(norm: NormalizedRequest, *, require_prompt: bool) -> NormalizedRequest:
@@ -321,15 +373,16 @@ def flatten_messages(messages: list[dict[str, str]]) -> tuple[str | None, str]:
 def route_preset(registry: PresetRegistry, model: str | None, max_tokens: int | None) -> Preset:
     """Pick the preset for a request.
 
-    An exact preset name always wins. Otherwise Haiku-class model names and tiny
-    ``max_tokens`` calls (title generation, quota probes from Claude Code) go to the
-    tool-less ``agy-light`` preset when it is available. Anything else unknown is a 404.
+    An exact preset name always wins. Otherwise Anthropic-style (``claude-*``) names that
+    are Haiku-class, or that make a tiny ``max_tokens`` call (title generation, quota probes
+    from Claude Code), go to the tool-less ``agy-light`` preset when it is available.
+    Anything else unknown is a 404.
     """
     if model and model in registry.names():
         return registry.resolve(model)
-    if LIGHT_PRESET in registry.names():
+    if LIGHT_PRESET in registry.names() and model and model.lower().startswith(LIGHT_MODEL_PREFIX):
         tiny = max_tokens is not None and max_tokens <= TINY_MAX_TOKENS
-        if tiny or (model and "haiku" in model.lower()):
+        if tiny or "haiku" in model.lower():
             return registry.resolve(LIGHT_PRESET)
     return registry.resolve(model)
 
@@ -351,22 +404,65 @@ async def events_for(
         )
     else:
         inner = ctx.runner.stream_stateless(preset, norm.messages)
-    async with aclosing(_cap_output(inner, norm.max_tokens)) as capped:
+    timeout = turn_deadline_seconds(ctx.settings.turn_timeout)
+    async with aclosing(with_deadline(_cap_output(inner, norm.max_tokens), timeout)) as capped:
         async for ev in capped:
             yield ev
 
 
+def turn_deadline_seconds(turn_timeout: float) -> float:
+    """Stream-side deadline, slightly inside the middleware's, so it fires first.
+
+    The admission middleware's own timeout can only truncate a response that already
+    started; this one lets the adapters finish the body with an error frame instead.
+    """
+    return max(0.05, turn_timeout - min(2.0, 0.1 * turn_timeout))
+
+
+async def with_deadline(events: AsyncIterator[Event], timeout: float) -> AsyncIterator[Event]:
+    """Yield ``events``; once ``timeout`` elapses yield a 504 ErrorEvent and stop.
+
+    Uses ``asyncio.timeout`` (no extra task) so anyio scopes inside the runner stay in the
+    task that created them. The inner stream is closed on the way out.
+    """
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    it = events.__aiter__()
+    try:
+        while True:
+            scope = asyncio.timeout_at(end)
+            try:
+                async with scope:
+                    ev = await it.__anext__()
+            except StopAsyncIteration:
+                return
+            except TimeoutError:
+                if not scope.expired():
+                    raise  # the stream's own timeout, not our deadline
+                yield ErrorEvent(GatewayTimeout(f"request exceeded {timeout:.0f}s"))
+                return
+            yield ev
+    finally:
+        close = getattr(it, "aclose", None)
+        if close is not None:
+            await close()
+
+
 async def _cap_output(events: AsyncIterator[Event], max_tokens: int | None) -> AsyncIterator[Event]:
-    """Stop the turn once the estimated output exceeds ``max_tokens``."""
+    """Stop the turn once the estimated *visible text* exceeds ``max_tokens``.
+
+    Thoughts are not counted: ``max_tokens`` limits the answer, and a long reasoning
+    prelude must not truncate it to nothing.
+    """
     async with aclosing(events) as stream:
         budget = None if max_tokens is None else max_tokens * 4
         used = 0
         async for ev in stream:
-            if budget is not None and isinstance(ev, TextEvent | ThoughtEvent):
+            if budget is not None and isinstance(ev, TextEvent):
                 remaining = budget - used
                 if len(ev.text) > remaining:
                     if remaining > 0:
-                        yield type(ev)(ev.text[:remaining])
+                        yield TextEvent(ev.text[:remaining])
                     yield DoneEvent(
                         stop_reason="MAX_OUTPUT_TOKENS_EXCEEDED", output_tokens=max_tokens
                     )

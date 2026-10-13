@@ -23,6 +23,7 @@ from typing import Any
 
 import yaml
 
+from .config import broad_workspace_reason
 from .errors import UnknownModelError
 
 logger = logging.getLogger("agy_proxy.presets")
@@ -119,6 +120,9 @@ class Preset:
                 raise ValueError(
                     f"preset {self.name!r}: workspace {ws!r} must be an existing absolute directory"
                 )
+            broad = broad_workspace_reason(p)
+            if broad:
+                raise ValueError(f"preset {self.name!r}: workspace {ws!r} is {broad}")
 
 
 class PresetRegistry:
@@ -188,8 +192,10 @@ class PresetRegistry:
             )
             preset.validate()
             enabled = bool(cfg.get("enabled", True))
-            if name == CODER_PRESET and enable_coder:
-                enabled = True
+            if preset.needs_workspace:
+                # AGY_ENABLE_CODER is the single opt-in for EVERY write-capable preset,
+                # whatever its name and whatever `enabled:` says in the yaml.
+                enabled = enable_coder and (enabled or name == CODER_PRESET)
             if not enabled:
                 disabled[name] = "disabled (set AGY_ENABLE_CODER=1 or edit presets.yaml)"
             elif preset.needs_workspace and not (workspace or preset.workspaces):

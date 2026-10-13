@@ -86,7 +86,7 @@ async def test_budget_cutoffs_are_done_and_logged(reason, caplog):
 async def test_exception_before_first_chunk_is_error_event():
     events = await _events(StubAgent(chat_exc=RuntimeError("spawn failed")))
     assert len(events) == 1 and isinstance(events[0], ErrorEvent)
-    assert "spawn failed" in events[0].message
+    assert events[0].message == "upstream error"  # detail is logged, never sent
     assert events[0].error.status == 502
 
 
