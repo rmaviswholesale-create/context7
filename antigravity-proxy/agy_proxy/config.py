@@ -111,6 +111,14 @@ class Settings:
     # Live-Agent session cache (stateful mode).
     session_ttl_seconds: int = 900
     session_max: int = 64
+    # P2 runtime limits.
+    max_concurrency: int = 4  # concurrent completions in flight; the next one gets 429
+    turn_timeout: int = 600  # seconds for one request, then 504
+    max_body_bytes: int = 1_048_576  # request body cap, then 413
+    teardown_timeout: int = 10  # seconds a harness gets to exit before SIGTERM/SIGKILL
+    # Per-request agent budget (0 disables); long-lived session agents get a scaled budget.
+    max_model_calls: int = 25
+    max_tool_calls: int = 50
     log_level: str = "info"
 
     @classmethod
@@ -137,5 +145,11 @@ class Settings:
             default_model=env.get("AGY_DEFAULT_MODEL", "gemini-3-pro"),
             session_ttl_seconds=_int(env, "AGY_SESSION_TTL", 900, 1),
             session_max=_int(env, "AGY_SESSION_MAX", 64, 1),
+            max_concurrency=_int(env, "AGY_MAX_CONCURRENCY", 4, 1),
+            turn_timeout=_int(env, "AGY_TURN_TIMEOUT", 600, 1),
+            max_body_bytes=_int(env, "AGY_MAX_BODY", 1_048_576, 1024),
+            teardown_timeout=_int(env, "AGY_TEARDOWN_TIMEOUT", 10, 1),
+            max_model_calls=_int(env, "AGY_MAX_MODEL_CALLS", 25, 0),
+            max_tool_calls=_int(env, "AGY_MAX_TOOL_CALLS", 50, 0),
             log_level=env.get("AGY_LOG_LEVEL", "info"),
         )

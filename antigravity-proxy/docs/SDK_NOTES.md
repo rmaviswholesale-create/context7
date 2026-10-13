@@ -121,3 +121,13 @@ who cannot fulfil them.
 | U8 | Termination with allowlist / no subagents | `FINISH` is only the structured-output tool (`get_last_structured_output`); nothing in Python requires it to end a turn, so read-only presets omit it. `CapabilitiesConfig` validators only complain about `max_subagent_depth` / `allowed_subagents` with subagents off. Runtime termination **unverified** (needs a real call). |
 | - | `env=` semantics | Merges (`{**os.environ, **env}`), cannot unset: scrub the process env at startup. |
 | - | `workspaces=None` | Becomes `[os.getcwd()]`: always pass explicit workspaces. |
+
+## Verification log (P2: runtime / lifecycle)
+
+| ID | Question | Result |
+|----|----------|--------|
+| U3 | Harness pid path | `agent.conversation.connection._process` is the `subprocess.Popen` (SDK 0.1.21, private). Confined to `agy_proxy/lifecycle.py`; pyproject pins `google-antigravity>=0.1.21,<0.2`. Missing path degrades to "no process known". Verified against the real binary. |
+| U4 | `cancel()` | `ChatResponse.cancel()` -> `Conversation.cancel()` -> `halt_request`; it halts the *turn*, not the process, and is a no-op once the response is done. After a halt `_client_cancelled` stays set until the next `send`, and `send` first drains `receive_steps()` (which raises `AntigravityCancelledError`) -> session agents whose turn did not finish are evicted, never reused. The runner halts via `agent.conversation.cancel()` (same call). |
+| U5 | Blocking disconnect | Confirmed: `LocalConnection.disconnect()` ends in a synchronous `Popen.wait(180)` (then terminate/kill) on the event-loop thread, so `asyncio.wait_for` cannot interrupt it. Handled by a thread watchdog (SIGTERM at `AGY_TEARDOWN_TIMEOUT`, SIGKILL 3 s later) plus `wait_for` for the async part. Tested with a fake harness that ignores stdin EOF / SIGTERM. A healthy real harness closes in ~20 ms. |
+| U5b | Blocking startup | `Agent.__aenter__` spawns the harness with sync `Popen`/`stdout.read`; measured loop stall with the real binary was ~0.16 s of a ~5 s open (the rest is async retry/backoff). Cancelling during open is made safe by running `__aenter__` as a shielded task and closing afterwards. A harness spawned by an `__aenter__` that is *force*-cancelled (open exceeded teardown timeout) cannot be located and could be orphaned: **open**, bounded by the harness exiting on stdin EOF. |
+| U9 | `stop_reason` / usage | Both are read lazily from the connection (`last_turn_usage`, `_last_turn_stop_reason`) and are only meaningful after the chunk stream is exhausted; `_run` reads them at that point. Budgets are lifetime-scoped (`BudgetScope.LIFETIME`) -> session agents get 20x the per-request budget. |

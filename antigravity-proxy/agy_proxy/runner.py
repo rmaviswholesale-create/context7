@@ -14,6 +14,7 @@ import os
 from collections.abc import AsyncIterator
 from typing import Any
 
+import anyio
 from google.antigravity import (
     Agent,
     BuiltinTools,
@@ -27,13 +28,15 @@ from google.antigravity.models import (
     ModelTarget,
     ThinkingLevel,
 )
-from google.antigravity.types import AgentBehavior
+from google.antigravity.types import AgentBehavior, BudgetConfig
 
 from .events import Event
-from .messages import flatten_messages, latest_user_text
+from .lifecycle import AgentLifecycle, agent_usable
+from .messages import flatten_messages
 from .presets import Preset, PresetRegistry
 from .runner_events import run_chat
 from .scratch import Scratch
+from .sessionkey import select_turn_messages
 
 logger = logging.getLogger("agy_proxy.runner")
 
@@ -75,6 +78,8 @@ def _tool_enum(names: list[str] | None) -> list[BuiltinTools] | None:
 
 _WRITE_TOOLS = ("CREATE_FILE", "EDIT_FILE", "RUN_COMMAND")
 _UNTRUSTED_LABEL = "[Untrusted client instructions]"
+# A session agent lives across turns; its lifetime budget is this many per-request budgets.
+_SESSION_BUDGET_TURNS = 20
 
 
 class AgentRunner:
@@ -85,10 +90,36 @@ class AgentRunner:
         registry: PresetRegistry,
         api_key: str | None,
         workspace: str | None = None,
+        *,
+        teardown_timeout: float = 10.0,
+        budget: BudgetConfig | None = None,
     ):
         self._registry = registry
         self._api_key = api_key
         self._workspace = workspace
+        self._budget = budget
+        self.lifecycle = AgentLifecycle(teardown_timeout)
+
+    @staticmethod
+    def budget_from(max_model_calls: int, max_tool_calls: int) -> BudgetConfig | None:
+        """Per-request agent budget from settings (0 = unlimited)."""
+        limits = {"max_model_calls": max_model_calls, "max_tool_calls": max_tool_calls}
+        limits = {k: v for k, v in limits.items() if v}
+        return BudgetConfig(**limits) if limits else None
+
+    # -- lifecycle (thin delegates; see lifecycle.AgentLifecycle) -------------
+
+    async def open_agent(self, agent: Agent) -> None:
+        await self.lifecycle.open(agent)
+
+    async def close_agent(self, agent: Agent) -> None:
+        await self.lifecycle.close(agent)
+
+    def is_usable(self, agent: Agent) -> bool:
+        return agent_usable(agent)
+
+    async def reap(self) -> int:
+        return await self.lifecycle.reap()
 
     # -- configuration -------------------------------------------------------
 
@@ -120,6 +151,7 @@ class AgentRunner:
             save_dir=scratch.save_dir,
             app_data_dir=scratch.app_data_dir,
             env=self._env(scratch),
+            budget_config=self._budget,
         )
 
     def _workspaces(self, preset: Preset, scratch: Scratch) -> list[str]:
@@ -159,11 +191,28 @@ class AgentRunner:
             return ModelTarget(name=model_name, endpoint=endpoint)
         return model_name
 
-    def new_agent(self, preset: Preset, system_extra: str | None = None) -> Agent:
-        """Create an un-entered Agent (caller manages the async context and cleanup)."""
+    def _session_budget(self) -> BudgetConfig | None:
+        """Budgets are lifetime-scoped in the SDK, so a long-lived agent gets a scaled one."""
+        if self._budget is None:
+            return None
+        scaled = {
+            name: value * _SESSION_BUDGET_TURNS
+            for name in ("max_model_calls", "max_tool_calls")
+            if (value := getattr(self._budget, name)) is not None
+        }
+        return self._budget.model_copy(update=scaled)
+
+    def new_agent(
+        self, preset: Preset, system_extra: str | None = None, *, long_lived: bool = False
+    ) -> Agent:
+        """Create an un-entered Agent. Open it with ``open_agent``, release with ``close_agent``
+        (which also removes its scratch tree); never ``async with`` it inside a generator."""
         scratch = Scratch()
         try:
-            agent = Agent(self.build_config(preset, system_extra, scratch))
+            config = self.build_config(preset, system_extra, scratch)
+            if long_lived:
+                config.budget_config = self._session_budget()
+            agent = Agent(config)
         except BaseException:
             scratch.cleanup()
             raise
@@ -179,21 +228,32 @@ class AgentRunner:
         system_extra, prompt = flatten_messages(messages)
         agent = self.new_agent(preset, system_extra)
         try:
-            async with agent:
-                async for ev in self._run(agent, prompt):
-                    yield ev
+            await self.open_agent(agent)
+            async for ev in self._run(agent, prompt):
+                yield ev
         finally:
-            scratch = getattr(agent, "scratch", None)
-            if scratch is not None:
-                scratch.cleanup()
+            # Runs on normal end, error, GeneratorExit and cancellation alike; the shield keeps
+            # anyio's level-triggered cancellation from interrupting the teardown awaits.
+            with anyio.CancelScope(shield=True):
+                await self.close_agent(agent)
 
     async def stream_on_agent(
-        self, agent: Agent, messages: list[dict[str, str]]
+        self, agent: Agent, messages: list[dict[str, str]], is_new: bool = False
     ) -> AsyncIterator[Event]:
-        """Stateful: send only the latest user turn to an already-open agent."""
-        prompt = latest_user_text(messages)
-        async for ev in self._run(agent, prompt):
-            yield ev
+        """Stateful turn on an already-open agent.
+
+        ``is_new`` (SessionLease.is_new): a fresh agent gets the client's full history
+        replayed; a reused one only the messages after its last assistant message.
+        """
+        _, prompt = flatten_messages(select_turn_messages(messages, is_new))
+        try:
+            async for ev in self._run(agent, prompt):
+                yield ev
+        finally:
+            # Consumer stopped early (disconnect/cancel): halt the turn, never leave it
+            # running inside a cached agent. The session store also evicts such agents.
+            with anyio.CancelScope(shield=True):
+                await self.lifecycle.halt_turn(agent)
 
     def _run(self, agent: Agent, prompt: str) -> AsyncIterator[Event]:
         return run_chat(agent, prompt)

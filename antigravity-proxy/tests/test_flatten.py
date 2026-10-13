@@ -13,6 +13,8 @@ from agy_proxy.messages import (
     flatten_messages,
     latest_user_text,
 )
+from agy_proxy.sessionkey import derive_session_key
+from agy_proxy.sessions import SessionLease
 
 
 def u(t):
@@ -88,8 +90,8 @@ class _Runner:
     def __init__(self):
         self.on_agent = []
 
-    async def stream_on_agent(self, agent, messages):
-        self.on_agent.append((agent, messages))
+    async def stream_on_agent(self, agent, messages, is_new=False):
+        self.on_agent.append((agent, messages, is_new))
         yield TextEvent("hi")
         yield DoneEvent()
 
@@ -105,7 +107,7 @@ class _Sessions:
     @asynccontextmanager
     async def acquire(self, sid, preset, system_extra):
         self.calls.append((sid, preset.name, system_extra))
-        yield "AGENT"
+        yield SessionLease("AGENT", is_new=True)
 
 
 async def test_events_for_uses_session_when_id_given():
@@ -117,7 +119,9 @@ async def test_events_for_uses_session_when_id_given():
         str(Path(__file__).resolve().parent.parent / "presets.yaml"), "gemini-3-pro"
     )
     runner, sessions = _Runner(), _Sessions()
-    ctx = SimpleNamespace(registry=reg, runner=runner, sessions=sessions)
+    ctx = SimpleNamespace(
+        registry=reg, runner=runner, sessions=sessions, settings=SimpleNamespace(proxy_token="tok")
+    )
     norm = NormalizedRequest(
         protocol="anthropic",
         model="agy-researcher",
@@ -126,5 +130,35 @@ async def test_events_for_uses_session_when_id_given():
     request = SimpleNamespace(headers={"x-agy-session": "abc"})
     events = [e async for e in events_for(ctx, norm, request)]
     assert [type(e) for e in events] == [TextEvent, DoneEvent]
-    assert sessions.calls == [("abc", "agy-researcher", "sys")]
+    assert sessions.calls == [(derive_session_key("tok", "abc"), "agy-researcher", "sys")]
     assert runner.on_agent[0][0] == "AGENT"
+    assert runner.on_agent[0][2] is True
+
+
+async def test_events_for_ignores_legacy_session_ids():
+    from pathlib import Path
+
+    from agy_proxy.presets import PresetRegistry
+
+    reg = PresetRegistry.load(
+        str(Path(__file__).resolve().parent.parent / "presets.yaml"), "gemini-3-pro"
+    )
+
+    class _Stateless(_Runner):
+        async def stream_stateless(self, preset, messages):
+            yield TextEvent("x")
+            yield DoneEvent()
+
+    ctx = SimpleNamespace(
+        registry=reg,
+        runner=_Stateless(),
+        sessions=_Sessions(),
+        settings=SimpleNamespace(proxy_token="tok"),
+    )
+    norm = NormalizedRequest(
+        protocol="openai", model="agy-researcher", messages=[u("q")], user="someone"
+    )
+    request = SimpleNamespace(headers={"x-session-id": "abc"})
+    events = [e async for e in events_for(ctx, norm, request)]
+    assert [type(e) for e in events] == [TextEvent, DoneEvent]
+    assert ctx.sessions.calls == []

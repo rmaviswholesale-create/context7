@@ -5,8 +5,8 @@
   with text-only content) or raise :class:`~agy_proxy.errors.InvalidRequest`.
 * ``flatten_messages`` / ``latest_user_text``: build the prompt for the agent. Turn
   text is indented so a user message can never forge a role label.
-* ``events_for``: the single place adapters obtain an event stream (P2 changes the
-  session wiring here and nowhere else); ``prime`` / ``guarded`` /
+* ``events_for``: the single place adapters obtain an event stream (stateless or
+  session, via ``stream_session_turn``); ``prime`` / ``guarded`` /
   ``collect``: start-up error status, terminal-event guarantees and non-streaming
   aggregation.
 """
@@ -27,6 +27,8 @@ from pydantic import BaseModel
 from .errors import InvalidRequest, UpstreamError, to_proxy_error
 from .events import DoneEvent, ErrorEvent, Event, TextEvent, ThoughtEvent
 from .presets import Preset, PresetRegistry
+from .sessionkey import session_key_from_headers
+from .sessions import stream_session_turn
 
 if TYPE_CHECKING:
     from .context import ProxyContext
@@ -332,29 +334,26 @@ def route_preset(registry: PresetRegistry, model: str | None, max_tokens: int | 
     return registry.resolve(model)
 
 
-def session_id(request: Request, norm: NormalizedRequest) -> str | None:
-    """Client-supplied session id (P2 replaces this with authenticated derivation)."""
-    return request.headers.get("x-agy-session") or request.headers.get("x-session-id") or norm.user
-
-
 async def events_for(
     ctx: ProxyContext, norm: NormalizedRequest, request: Request
 ) -> AsyncIterator[Event]:
-    """The event stream for a request, with ``max_tokens`` honoured."""
+    """The event stream for a request, with ``max_tokens`` honoured.
+
+    The single place that decides stateless vs session. Only the ``x-agy-session`` header
+    opts in; the store key is derived from the proxy token (see ``sessionkey``).
+    """
     preset = route_preset(ctx.registry, norm.model, norm.max_tokens)
-    sid = session_id(request, norm)
-    if sid:
+    key = session_key_from_headers(ctx.settings.proxy_token or "", request.headers)
+    if key:
         system_extra, _ = flatten_messages(norm.messages)
-        async with ctx.sessions.acquire(sid, preset, system_extra) as agent:
-            inner = ctx.runner.stream_on_agent(agent, norm.messages)
-            async with aclosing(_cap_output(inner, norm.max_tokens)) as capped:
-                async for ev in capped:
-                    yield ev
+        inner = stream_session_turn(
+            ctx.runner, ctx.sessions, key, preset, norm.messages, system_extra
+        )
     else:
         inner = ctx.runner.stream_stateless(preset, norm.messages)
-        async with aclosing(_cap_output(inner, norm.max_tokens)) as capped:
-            async for ev in capped:
-                yield ev
+    async with aclosing(_cap_output(inner, norm.max_tokens)) as capped:
+        async for ev in capped:
+            yield ev
 
 
 async def _cap_output(events: AsyncIterator[Event], max_tokens: int | None) -> AsyncIterator[Event]:

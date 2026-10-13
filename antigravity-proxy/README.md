@@ -164,10 +164,14 @@ Fields: `system_instructions`, `model`, `policy`
 
 - **No session id →** stateless: the whole `messages` array is replayed into a
   fresh agent each call. Works with every client out of the box.
-- **Session id present →** stateful: a live Agent is kept per session (LRU + TTL
-  bounded, see `AGY_SESSION_*`), so follow-ups reuse the SDK's own memory and skip
-  harness startup. Send it via the `x-agy-session` header, or the OpenAI `user`
-  field.
+- **`x-agy-session` header present →** stateful: a live Agent is kept per session
+  (LRU + TTL bounded, see `AGY_SESSION_*`), so follow-ups reuse the SDK's own memory
+  and skip harness startup. The id must match `[A-Za-z0-9_.:-]{1,64}` and is scoped to
+  your proxy token. The first turn replays the client's full history; later turns send
+  only the messages after the last assistant message. The OpenAI `user` field and
+  `x-session-id` are **ignored**. A session whose turn fails, is cancelled, or whose
+  harness died is discarded; when all `AGY_SESSION_MAX` sessions are busy a new one
+  gets `429`.
 
 ## Configuration reference
 
@@ -182,7 +186,12 @@ Fields: `system_instructions`, `model`, `policy`
 | `AGY_LOG_TOOLS` | `1` | Log the agent's tool calls (never sent to clients) |
 | `AGY_DEFAULT_MODEL` | `gemini-3-pro` | Model when a preset pins none |
 | `AGY_PRESETS` | `./presets.yaml` | Presets file path |
-| `AGY_SESSION_TTL` / `AGY_SESSION_MAX` | `900` / `64` | Live-agent cache bounds |
+| `AGY_SESSION_TTL` / `AGY_SESSION_MAX` | `900` / `64` | Live-agent cache bounds (idle seconds / entries) |
+| `AGY_MAX_CONCURRENCY` | `4` | Completions in flight; the next one gets `429` immediately |
+| `AGY_TURN_TIMEOUT` | `600` | Seconds per request before `504` (a streaming response is truncated) |
+| `AGY_MAX_BODY` | `1048576` | Request body cap in bytes (`413`, also for chunked bodies) |
+| `AGY_TEARDOWN_TIMEOUT` | `10` | Seconds a harness gets to exit before SIGTERM, then SIGKILL |
+| `AGY_MAX_MODEL_CALLS` / `AGY_MAX_TOOL_CALLS` | `25` / `50` | Per-request agent budget (`0` = unlimited; session agents get 20x) |
 
 ## Endpoints
 
